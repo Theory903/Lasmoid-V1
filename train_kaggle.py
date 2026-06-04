@@ -589,6 +589,49 @@ def main():
     )
     args = p.parse_args()
 
+    # ── Early data_check exit ──
+    # Must run before ANY torch.cuda calls (which initialize CUDA and prevent subsequent forks)
+    if args.data_check:
+        is_master = int(os.environ.get("RANK", 0)) == 0
+        if is_master:
+            from datasets import load_dataset
+            _hf_token = os.getenv("HF_TOKEN")
+            print("\n  Data check mode — verifying all 8 streams\n")
+            stream_infos = [
+                (
+                    "UltraFineWeb",
+                    "openbmb/Ultra-FineWeb-L3",
+                    "Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+                    "train",
+                ),
+                ("UltraData-IF",   "openbmb/UltraData-SFT-2605", "IF",          "no_think"),
+                ("UltraData-Math", "openbmb/UltraData-SFT-2605", "Math",        "no_think"),
+                ("UltraData-Code", "openbmb/UltraData-SFT-2605", "Code",        "no_think"),
+                ("Claude-Mythos",  "WithinUsAI/claude_mythos_distilled_25k", None, "train"),
+                ("DeepThink",      "HelioAI/Claude-Opus-4.8-DeepThink-462x-105M", None, "train"),
+                ("PythonEdu",      "HuggingFaceTB/smollm-corpus", "python-edu", "train"),
+                ("FineWeb-Edu",    "HuggingFaceFW/fineweb-edu",   "sample-10BT", "train"),
+            ]
+            for label, path, config, split in stream_infos:
+                print(f"\n  [{label}]")
+                print(f"    dataset: {path}")
+                if config:
+                    print(f"    config:  {config}")
+                print(f"    split:   {split}")
+                try:
+                    ds = load_dataset(path, config, split=split, streaming=True, token=_hf_token)
+                    first = next(iter(ds))
+                    print(f"    columns: {list(first.keys())}")
+                    for k, v in first.items():
+                        val = str(v)
+                        if len(val) > 150:
+                            val = val[:150] + "..."
+                        print(f"      {k}: {type(v).__name__} = {val}")
+                except Exception as e:
+                    print(f"    ERROR: {e}")
+            print("\n  All stream checks complete ✓")
+        sys.exit(0)
+
     global _SESSION_LIMIT
     _SESSION_LIMIT = args.session_hours * 3600
 
@@ -634,52 +677,6 @@ def main():
         print(f"  Device : {device.upper()} (DDP: {ddp}, World Size: {ddp_world_size}) | AMP: {args.dtype}")
         print(f"  Model  : {args.model_size} | theory903/Lasmoid-V1")
         print(f"{'═' * 70}\n")
-
-    # ── Early data_check exit — MUST run before model/CUDA init ───────────
-    # datasets uses internal forking (Arrow/multiprocessing). Forking after
-    # CUDA is initialised triggers SIGABRT. Exit here, before model build.
-    if args.data_check:
-        if master_process:
-            from datasets import load_dataset
-            _hf_token = os.getenv("HF_TOKEN")
-            print("\n  Data check mode — verifying all 8 streams\n")
-            stream_infos = [
-                (
-                    "UltraFineWeb",
-                    "openbmb/Ultra-FineWeb-L3",
-                    "Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
-                    "train",
-                ),
-                ("UltraData-IF",   "openbmb/UltraData-SFT-2605", "IF",          "no_think"),
-                ("UltraData-Math", "openbmb/UltraData-SFT-2605", "Math",        "no_think"),
-                ("UltraData-Code", "openbmb/UltraData-SFT-2605", "Code",        "no_think"),
-                ("Claude-Mythos",  "WithinUsAI/claude_mythos_distilled_25k", None, "train"),
-                ("DeepThink",      "HelioAI/Claude-Opus-4.8-DeepThink-462x-105M", None, "train"),
-                ("PythonEdu",      "HuggingFaceTB/smollm-corpus", "python-edu", "train"),
-                ("FineWeb-Edu",    "HuggingFaceFW/fineweb-edu",   "sample-10BT", "train"),
-            ]
-            for label, path, config, split in stream_infos:
-                print(f"\n  [{label}]")
-                print(f"    dataset: {path}")
-                if config:
-                    print(f"    config:  {config}")
-                print(f"    split:   {split}")
-                try:
-                    ds = load_dataset(path, config, split=split, streaming=True, token=_hf_token)
-                    first = next(iter(ds))
-                    print(f"    columns: {list(first.keys())}")
-                    for k, v in first.items():
-                        val = str(v)
-                        if len(val) > 150:
-                            val = val[:150] + "..."
-                        print(f"      {k}: {type(v).__name__} = {val}")
-                except Exception as e:
-                    print(f"    ERROR: {e}")
-            print("\n  All stream checks complete ✓")
-        if ddp and dist.is_initialized():
-            dist.barrier()
-            dist.destroy_process_group()
-        sys.exit(0)   # exit 0 = success; satisfies check=True in subprocess.run
 
     if master_process:
         os.makedirs(args.checkpoint_dir, exist_ok=True)
