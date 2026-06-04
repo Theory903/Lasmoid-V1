@@ -824,7 +824,6 @@ def main():
             dist.destroy_process_group()
         return
     else:
-        tok = tiktoken.get_encoding("gpt2")
 
         # ── Curriculum Streams (inspired by Llama-3, Phi-4, YuLan-Mini) ──
         print("\n  Initialising data streams:")
@@ -1058,8 +1057,6 @@ def main():
             
             if args.phase == "fst" and gepa_mutator is not None and step % 100 == 0 and master_process:
                 print(f"  [FST] Running GEPA prompt optimization cycle at step {step}...")
-                import tiktoken
-                tok = tiktoken.get_encoding("gpt2")
                 # Generate proposed mutations
                 candidates = gepa_mutator.propose_mutations(model, tok, device, num_mutations=3)
                 
