@@ -614,6 +614,18 @@ class ElasticSparseConceptMemory(nn.Module):
 #   • hash routing (first n_hash_layers)
 # SOVEREIGN: sqrtsoftplus is the Lasmoid sovereign score function
 # ══════════════════════════════════════════════════════════════════════
+def is_recomputing() -> bool:
+    import sys
+    frame = sys._getframe()
+    while frame:
+        co_name = frame.f_code.co_name
+        co_filename = frame.f_code.co_filename
+        if "checkpoint" in co_filename and co_name in ("unpack_hook", "backward", "reconstruct"):
+            return True
+        frame = frame.f_back
+    return False
+
+
 class Gate(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
         super().__init__()
@@ -622,6 +634,7 @@ class Gate(nn.Module):
         self.route_scale = args.route_scale
         self.use_hash    = layer_id < args.n_hash_layers
         self.ema_bias_lr = args.ema_bias_lr
+        self.pending_bias_updates = []
 
         self.weight = nn.Parameter(torch.empty(args.n_routed_experts, args.dim))
         nn.init.normal_(self.weight, 0.0, 0.02)
@@ -634,7 +647,17 @@ class Gate(nn.Module):
             self.bias = None
         else:
             # Auxiliary bias: shifts topk selection but NOT the routing weights (V4-Pro)
-            self.bias = nn.Parameter(torch.zeros(args.n_routed_experts, dtype=torch.float32))
+            self.bias = nn.Parameter(
+                torch.zeros(args.n_routed_experts, dtype=torch.float32),
+                requires_grad=False,
+            )
+
+    def apply_pending_updates(self):
+        if self.bias is not None and self.pending_bias_updates:
+            with torch.no_grad():
+                for update in self.pending_bias_updates:
+                    self.bias.add_(update)
+            self.pending_bias_updates.clear()
 
     def forward(
         self,
@@ -665,7 +688,7 @@ class Gate(nn.Module):
             indices = scores.topk(self.topk, dim=-1)[1]
 
         # EMA bias balancing update (DDP-synchronized)
-        if self.training and self.bias is not None:
+        if self.training and self.bias is not None and not is_recomputing():
             with torch.no_grad():
                 counts = torch.bincount(indices.flatten(), minlength=self.weight.shape[0]).float()
                 
@@ -678,7 +701,7 @@ class Gate(nn.Module):
                 
                 target_fraction = 1.0 / self.weight.shape[0]
                 bias_update = self.ema_bias_lr * torch.sign(target_fraction - routing_fraction)
-                self.bias.add_(bias_update)
+                self.pending_bias_updates.append(bias_update)
 
         weights = original_scores.gather(1, indices)
 
@@ -985,6 +1008,11 @@ class LasmoidV1(nn.Module):
 
     def gradient_checkpointing_enable(self, **kwargs):
         self.gradient_checkpointing = True
+
+    def apply_pending_bias_updates(self):
+        for m in self.modules():
+            if isinstance(m, Gate):
+                m.apply_pending_updates()
 
     def _hc_head_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """HC head: sigmoid-based weighted sum over hc streams."""

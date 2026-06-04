@@ -1038,6 +1038,10 @@ def main():
             total_mtp += mtp.item()
             total_z += z_loss.item()
 
+        # Apply pending MoE bias updates
+        raw_model = model.module if ddp else model
+        raw_model.apply_pending_bias_updates()
+
         # ── Clip + Step ───────────────────────────────────────────────
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         opt_muon.step()
