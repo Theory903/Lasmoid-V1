@@ -505,7 +505,7 @@ def sparse_attn(
     B, S, H, D = q.shape
     topk = topk_idxs.shape[-1]
     
-    if HAS_TRITON and q.is_cuda:
+    if HAS_TRITON and SUPPORT_FP8_TRITON and q.is_cuda:
         # Create output tensor
         out = torch.empty((B, S, H, D), dtype=q.dtype, device=q.device)
         

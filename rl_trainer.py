@@ -83,10 +83,22 @@ def stream_rl_prompts(
     from datasets import load_dataset
 
     def _load(name, config, split, question_field, answer_field=None):
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        
         ds = load_dataset(name, config, split=split, streaming=True, token=hf_token)
-        for item in ds:
-            q = item.get(question_field, "")
-            a = item.get(answer_field) if answer_field else None
+        use_row_sharding = False
+        if world_size > 1:
+            if getattr(ds, "n_shards", 1) >= world_size:
+                ds = ds.shard(num_shards=world_size, index=rank)
+            else:
+                use_row_sharding = True
+                
+        for row_idx, row in enumerate(ds):
+            if use_row_sharding and (row_idx % world_size) != rank:
+                continue
+            q = row.get(question_field, "")
+            a = row.get(answer_field) if answer_field else None
             if not q:
                 continue
             prompt_str = format_prompt(str(q))

@@ -515,8 +515,57 @@ def load_checkpoint(model, opt_muon, opt_adamw, api, repo_id, hf_token, device):
         ckpt = torch.load(path, map_location=device, weights_only=False)
         raw_model = model.module if hasattr(model, "module") else model
         raw_model.load_state_dict(ckpt["model_state_dict"])
-        opt_muon.load_state_dict(ckpt["opt_muon_state"])
-        opt_adamw.load_state_dict(ckpt["opt_adamw_state"])
+        
+        # Reconstruct parameter lists as they were partitioned in the saved checkpoint (V2 partitioning)
+        saved_muon_params = []
+        saved_adamw_params = []
+        for name, p in raw_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if (
+                p.ndim == 2
+                and "emb" not in name
+                and "head" not in name
+                and "adj" not in name
+            ):
+                saved_muon_params.append(p)
+            else:
+                saved_adamw_params.append(p)
+
+        # Reconstruct state mapping for Muon
+        if "opt_muon_state" in ckpt:
+            muon_param_ids = []
+            for group in ckpt["opt_muon_state"]["param_groups"]:
+                muon_param_ids.extend(group["params"])
+            muon_state_map = {}
+            for idx, p in enumerate(saved_muon_params):
+                if idx < len(muon_param_ids):
+                    p_id = muon_param_ids[idx]
+                    if p_id in ckpt["opt_muon_state"]["state"]:
+                        muon_state_map[p] = ckpt["opt_muon_state"]["state"][p_id]
+            # Load states into current Muon optimizer
+            for group in opt_muon.param_groups:
+                for p in group["params"]:
+                    if p in muon_state_map:
+                        opt_muon.state[p] = muon_state_map[p]
+
+        # Reconstruct state mapping for AdamW
+        if "opt_adamw_state" in ckpt:
+            adamw_param_ids = []
+            for group in ckpt["opt_adamw_state"]["param_groups"]:
+                adamw_param_ids.extend(group["params"])
+            adamw_state_map = {}
+            for idx, p in enumerate(saved_adamw_params):
+                if idx < len(adamw_param_ids):
+                    p_id = adamw_param_ids[idx]
+                    if p_id in ckpt["opt_adamw_state"]["state"]:
+                        adamw_state_map[p] = ckpt["opt_adamw_state"]["state"][p_id]
+            # Load states into current AdamW optimizer
+            for group in opt_adamw.param_groups:
+                for p in group["params"]:
+                    if p in adamw_state_map:
+                        opt_adamw.state[p] = adamw_state_map[p]
+                        
         step = ckpt["step"] + 1
         tokens = ckpt.get("tokens_seen", 0)
         print(
@@ -770,6 +819,8 @@ def main():
             and "emb" not in name
             and "head" not in name
             and "adj" not in name
+            and "gate" not in name
+            and "hc" not in name
         ):
             muon_params.append(param)
         else:

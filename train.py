@@ -105,8 +105,15 @@ def train():
     muon_params, adamw_params = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad: continue
-        # 2D weights updated by Muon (excluding embedding layers, heads, and gate routers)
-        if len(p.shape) == 2 and "emb" not in name and "head" not in name and "adj" not in name:
+        # 2D weights updated by Muon (excluding embedding layers, heads, gate routers, and hyper-connections)
+        if (
+            len(p.shape) == 2
+            and "emb" not in name
+            and "head" not in name
+            and "adj" not in name
+            and "gate" not in name
+            and "hc" not in name
+        ):
             muon_params.append(p)
         else:
             adamw_params.append(p)
@@ -146,7 +153,10 @@ def train():
             ce_loss_mtp = torch.tensor(0.0, device=device)
             if logits_next_next is not None:
                 # yb shifted for t+2 prediction
-                ce_loss_mtp = F.cross_entropy(logits_next_next.view(-1, model_args.vocab_size), yb[:, 1:].contiguous().view(-1))
+                ce_loss_mtp = F.cross_entropy(
+                    logits_next_next[:, :-1].contiguous().view(-1, model_args.vocab_size),
+                    yb[:, 1:].contiguous().view(-1)
+                )
             
             loss = ce_loss_next + 0.3 * ce_loss_mtp
             loss = loss / args_cli.grad_accum
