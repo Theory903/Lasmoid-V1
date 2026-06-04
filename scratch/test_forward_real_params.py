@@ -7,51 +7,39 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from inference.model import LasmoidV1, ModelArgs
-from train_kaggle import MODEL_CONFIGS, Muon
+from train_kaggle import MODEL_CONFIGS
 
 def main():
-    print("Initializing model...")
     cfg = MODEL_CONFIGS["10M"].copy()
     cfg.pop("_verified_params", None)
-    cfg["max_seq_len"] = 256
-    cfg["max_batch_size"] = 2
+    cfg["max_seq_len"] = 1024
+    cfg["max_batch_size"] = 4
     
     model_args = ModelArgs(**cfg)
     model = LasmoidV1(model_args)
     
-    # Download checkpoint from HF Hub
     token = os.getenv("HF_TOKEN")
     repo_id = "Theory903/lasmoid-10m"
     filename = "lasmoid_step_00000400.pt"
     
-    print(f"Downloading checkpoint {filename}...")
     path = hf_hub_download(repo_id=repo_id, filename=filename, token=token)
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    
-    print("Loading model state dict...")
     model.load_state_dict(ckpt["model_state_dict"])
     
-    print("\n--- Weight Magnitudes ---")
-    for name, p in model.named_parameters():
-        if p.requires_grad and ("gate" in name or "hc_fn" in name or "emb" in name or "head" in name):
-            print(f"  {name:40s} | shape: {str(list(p.shape)):15s} | max: {p.abs().max().item():.4f} | mean: {p.mean().item():.4f} | std: {p.std().item():.4f}")
-            
-    # Run a forward pass
-    xb = torch.randint(0, model_args.vocab_size - 1, (2, 256), dtype=torch.long)
-    yb = torch.randint(0, model_args.vocab_size - 1, (2, 256), dtype=torch.long)
-    
     model.train()
+    
+    # Batch size 4, sequence length 1024
+    xb = torch.randint(0, model_args.vocab_size - 1, (4, 1024), dtype=torch.long)
+    yb = torch.randint(0, model_args.vocab_size - 1, (4, 1024), dtype=torch.long)
+    
     with torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16):
         logits_nxt, logits_nxt2, _, _ = model(xb, yb)
         z_loss = model.last_z_loss
+        ce = F.cross_entropy(logits_nxt.view(-1, model_args.vocab_size), yb.view(-1))
         
-        ce = F.cross_entropy(
-            logits_nxt.view(-1, model_args.vocab_size),
-            yb.view(-1),
-            ignore_index=-1,
-        )
-        
-    print("\n--- Mock Forward Pass ---")
+    print("\n--- Forward Pass with Real Params (B=4, S=1024) ---")
+    print(f"Logits shape:      {logits_nxt.shape}")
+    print(f"Logits min/max:    {logits_nxt.min().item():.4f} / {logits_nxt.max().item():.4f}")
     print(f"Cross Entropy (CE): {ce.item():.4f}")
     print(f"Router Z-loss:      {z_loss.item():.4f}")
 

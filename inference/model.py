@@ -353,8 +353,11 @@ class MLA(nn.Module):
         # slice — calling .contiguous() first creates a temporary copy, so the
         # inplace=True flag would write into that copy and the original kv is
         # never modified. Assign the return value back instead.
-        nope_q, _ = act_quant(kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype)
-        kv = torch.cat([nope_q.to(kv.dtype), kv[..., -self.rope_head_dim:]], dim=-1)
+        # ALSO: must multiply by scale factor to dequantize back to standard range,
+        # otherwise values blow up standard range by ~180x.
+        nope_q, scale = act_quant(kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype)
+        nope_q = nope_q.to(kv.dtype) * scale.to(kv.dtype)
+        kv = torch.cat([nope_q, kv[..., -self.rope_head_dim:]], dim=-1)
 
         # ── Update KV cache (sliding window) ─────────────────────────
         if B > self.kv_cache.shape[0]:
@@ -388,8 +391,9 @@ class MLA(nn.Module):
             concept_kv = self.wkv(concept_db) # (B, C, head_dim)
             concept_kv = self.kv_norm(concept_kv)
             # QAT: simulate FP8 on nope dims — same fix as kv path above
-            c_nope_q, _ = act_quant(concept_kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype)
-            concept_kv = torch.cat([c_nope_q.to(concept_kv.dtype), concept_kv[..., -self.rope_head_dim:]], dim=-1)
+            c_nope_q, c_scale = act_quant(concept_kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype)
+            c_nope_q = c_nope_q.to(concept_kv.dtype) * c_scale.to(concept_kv.dtype)
+            concept_kv = torch.cat([c_nope_q, concept_kv[..., -self.rope_head_dim:]], dim=-1)
             
             # Concatenate token KV cache and concept KV along sequence dimension
             K_combined = torch.cat([K_cache, concept_kv], dim=1)
