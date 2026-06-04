@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+checkpoints/
+.DS_Store
+.venv/
+input.txt
