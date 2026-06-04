@@ -34,6 +34,7 @@ HAS_TRITON   = False
 HAS_TILELANG = False
 
 try:
+    # pyrefly: ignore [missing-import]
     import tilelang
     import tilelang.language as T
     HAS_TILELANG = True
