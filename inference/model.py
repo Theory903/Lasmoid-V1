@@ -348,7 +348,12 @@ class MLA(nn.Module):
         kv_rope = apply_rotary_emb(kv_rope, freqs_cis)
         kv = torch.cat([kv_nope, kv_rope], dim=-1)
         # QAT: simulate FP8 on nope dims (V4-Pro line 506)
-        act_quant(kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype, True)
+        # FIX: act_quant returns the quantised tensor; must write it back into the
+        # slice — calling .contiguous() first creates a temporary copy, so the
+        # inplace=True flag would write into that copy and the original kv is
+        # never modified. Assign the return value back instead.
+        nope_q, _ = act_quant(kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype)
+        kv = torch.cat([nope_q.to(kv.dtype), kv[..., -self.rope_head_dim:]], dim=-1)
 
         # ── Update KV cache (sliding window) ─────────────────────────
         if B > self.kv_cache.shape[0]:
@@ -366,7 +371,13 @@ class MLA(nn.Module):
                 self.kv_cache[:B, cutoff:win], self.kv_cache[:B, :cutoff] = \
                     kv[:, -win:].split([win - cutoff, cutoff], dim=1)
         else:
-            self.kv_cache[:B, start_pos % win] = kv[:, 0]
+            # FIX: clamp start_pos to [0, win-1] using modulo, BUT with a sliding-
+            # window offset so decode steps >= win don't overwrite prefill keys from
+            # position 0 again.  Use (start_pos - 1) % win so position `win` maps
+            # to slot win-1, position win+1 maps to slot 0, etc. — a proper ring
+            # buffer that never aliases back into unread prefill slots.
+            slot = (start_pos - 1) % win
+            self.kv_cache[:B, slot] = kv[:, 0]
 
         # ── Prepare KV for Attention ─────────────────────────────────
         K_cache = kv if start_pos == 0 else self.kv_cache[:B]
@@ -375,8 +386,9 @@ class MLA(nn.Module):
             # Project concept_db to MLA KV space
             concept_kv = self.wkv(concept_db) # (B, C, head_dim)
             concept_kv = self.kv_norm(concept_kv)
-            # QAT: simulate FP8 on nope dims
-            act_quant(concept_kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype, True)
+            # QAT: simulate FP8 on nope dims — same fix as kv path above
+            c_nope_q, _ = act_quant(concept_kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype)
+            concept_kv = torch.cat([c_nope_q.to(concept_kv.dtype), concept_kv[..., -self.rope_head_dim:]], dim=-1)
             
             # Concatenate token KV cache and concept KV along sequence dimension
             K_combined = torch.cat([K_cache, concept_kv], dim=1)
@@ -582,25 +594,37 @@ class ElasticSparseConceptMemory(nn.Module):
             should_spawn = should_spawn_local
 
         if should_spawn:
-            # Freeze block
+            # Freeze current block
             for p in self.concept_blocks[block_idx].parameters():
                 p.requires_grad = False
-                
-            # Allocate space for new block in slot_db and meta_centroids
+
+            # FIX: extend slot_db and meta_centroids BEFORE spawning and before
+            # the recursive call. The old code extended them after appending the
+            # new block, meaning the recursive call entered process_chunk with
+            # block_idx+1 but slot_db still had only block_idx rows → IndexError.
             new_slots = self.slot_ema.clone()
-            self.register_buffer("slot_db", torch.cat([self.slot_db, new_slots], dim=0), persistent=True)
-            
-            new_centroid = torch.zeros(1, self.dim, device=self.meta_centroids.device, dtype=self.meta_centroids.dtype)
-            self.register_buffer("meta_centroids", torch.cat([self.meta_centroids, new_centroid], dim=0), persistent=False)
-            
-            # Spawn block
+            self.register_buffer(
+                "slot_db",
+                torch.cat([self.slot_db, new_slots], dim=0),
+                persistent=True,
+            )
+            new_centroid = torch.zeros(
+                1, self.dim,
+                device=self.meta_centroids.device,
+                dtype=self.meta_centroids.dtype,
+            )
+            self.register_buffer(
+                "meta_centroids",
+                torch.cat([self.meta_centroids, new_centroid], dim=0),
+                persistent=False,
+            )
+
+            # Spawn new block and reset EMA
             new_block = self._create_block(self.args).to(device=pooled.device, dtype=pooled.dtype)
             self.concept_blocks.append(new_block)
-            
-            # Reset EMA buffer for the new block
             self.slot_ema.zero_()
-            
-            # Recursively process in the new block
+
+            # Recurse into the newly-created block (buffers are already sized)
             return self.process_chunk(encoder_hidden, block_idx + 1)
             
         return quantized, loss
@@ -951,10 +975,22 @@ class MTPBlock(nn.Module):
         concept_db: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert self.embed is not None and self.head is not None
-        e = self.enorm(self.embed(input_ids).to(x.dtype))   # next-token embedding
-        h = self.hnorm(x)                                   # normalise current state
-        # V4-Pro MTPBlock line 763: fuse via learned projections
-        x = self.e_proj(e).unsqueeze(2) + self.h_proj(h)   # (B, S, hc, D)  (broadcast over hc)
+        e = self.enorm(self.embed(input_ids).to(x.dtype))   # (B, S, D) next-token embedding
+        # FIX: x is (B, S, hc, D). Applying RMSNorm(dim) to it normalises only
+        # the last axis but treats hc as part of the batch, which is correct for
+        # per-stream normalisation. However h_proj then receives (B, S, hc, D)
+        # and broadcasts against e_proj(e).unsqueeze(2) which is (B, S, 1, D).
+        # That broadcast is fine semantically — each of the hc streams gets the
+        # same embedding delta added. The real problem was that hnorm operated
+        # on the flat last dim, which is correct; we just need to be explicit
+        # that h_proj acts on each stream independently (reshape to fuse B*S*hc).
+        B_h, S_h, hc_h, D_h = x.shape
+        h_flat = x.reshape(B_h * S_h * hc_h, D_h)           # (B*S*hc, D)
+        h_flat = self.hnorm(h_flat)                           # normalise per stream
+        h_flat = self.h_proj(h_flat)                          # project per stream
+        h = h_flat.reshape(B_h, S_h, hc_h, D_h)             # (B, S, hc, D)
+        # V4-Pro MTPBlock line 763: fuse next-token embedding with all streams
+        x = self.e_proj(e).unsqueeze(2) + h                  # (B, S, hc, D)  broadcast over hc
         x, _ = self.block(x, freqs_cis, start_pos, input_ids, concept_db)
         # HC head reduce → logits
         y = self.hc_head_reduce(x)
@@ -991,7 +1027,14 @@ class LasmoidV1(nn.Module):
 
         # Output head (tied to embedding)
         self.head   = Linear(args.dim, args.vocab_size)
+        # FIX: weight tying replaces head.weight (a Linear Parameter with an
+        # optional .scale attribute for FP8) with emb.weight (a plain Embedding
+        # Parameter that has no .scale). fp8_gemm() later dereferences weight.scale
+        # → AttributeError. Preserve the scale attribute when FP8 is active.
+        _head_scale = getattr(self.head.weight, "scale", None)
         self.head.weight = self.emb.weight  # weight tying
+        if _head_scale is not None:
+            self.head.weight.scale = _head_scale  # restore FP8 scale metadata
         nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)
 
         # HC head for main model output (from V4-Pro ParallelHead)

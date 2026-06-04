@@ -76,7 +76,12 @@ def _apply_dry(
     for idx in match_indices:
         # Walk backwards from the match to find the longest repeated n-gram
         match_len = 1
-        while (match_len < dry_allowed_length and
+        # FIX: guard was `match_len < dry_allowed_length` which stops the walk at
+        # match_len == dry_allowed_length-1. The subsequent `if match_len <
+        # dry_allowed_length: continue` then always skipped exact minimum-length
+        # matches. Changed to `<=` so the walk can reach dry_allowed_length and the
+        # check below passes correctly.
+        while (match_len <= dry_allowed_length and
                idx - match_len >= 0 and
                len(generated) - 1 - match_len >= 0 and
                generated[idx - match_len] == generated[-1 - match_len]):
@@ -157,13 +162,17 @@ def _apply_top_p(logits: torch.Tensor, top_p: float = 1.0) -> torch.Tensor:
     # Remove tokens with cumulative prob > top_p (shift by 1 to keep the token
     # that pushes over the threshold)
     remove_mask = (cumulative - sorted_probs) > top_p
-    sorted_probs[remove_mask] = 0.0
 
-    # Scatter back to original order
-    filtered = torch.zeros_like(logits)
-    filtered.scatter_(-1, sorted_idx, sorted_probs)
-    logits = filtered.log()  # convert back to log-space
-    logits[logits == float("-inf")] = float("-inf")
+    # FIX: the old code converted filtered probs back to log-space via .log(),
+    # returning values ≤ 0.  _apply_top_k (called next) compares raw logit values
+    # against a threshold from torch.topk — raw logits can be large positives, so
+    # all log-probs would be below the threshold and top_k became a silent no-op.
+    # Fix: scatter -inf back onto the original logit tensor instead, keeping the
+    # pipeline in a consistent raw-logit space throughout.
+    remove_original = torch.zeros_like(logits, dtype=torch.bool)
+    remove_original.scatter_(-1, sorted_idx, remove_mask)
+    logits = logits.clone()
+    logits[remove_original] = float("-inf")
     return logits
 
 
