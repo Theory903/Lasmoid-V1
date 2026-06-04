@@ -87,7 +87,7 @@ def run_test():
     muon_params, adamw_params = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad: continue
-        if len(p.shape) == 2 and "emb" not in name and "adj" not in name: muon_params.append(p)
+        if len(p.shape) == 2 and "emb" not in name and "head" not in name and "adj" not in name: muon_params.append(p)
         else: adamw_params.append(p)
 
     opt_muon = Muon(muon_params, lr=2e-3)
