@@ -147,12 +147,17 @@ class EMA:
         raw_model = model.module if hasattr(model, "module") else model
         for name, param in raw_model.named_parameters():
             if param.requires_grad:
-                self.shadow[name].lerp_(param.data, 1.0 - self.decay)
+                if name not in self.shadow:
+                    self.shadow[name] = param.data.clone()
+                else:
+                    self.shadow[name].lerp_(param.data, 1.0 - self.decay)
 
     def swap(self, model: torch.nn.Module):
         raw_model = model.module if hasattr(model, "module") else model
         for name, param in raw_model.named_parameters():
             if param.requires_grad:
+                if name not in self.shadow:
+                    self.shadow[name] = param.data.clone()
                 tmp = param.data.clone()
                 param.data.copy_(self.shadow[name])
                 self.shadow[name].copy_(tmp)
