@@ -587,7 +587,7 @@ def hc_split_sinkhorn(
     B, S, mix_hc = mixes.shape
     assert mix_hc == (2 + hc_mult) * hc_mult, f"Expected mixes dim={(2+hc_mult)*hc_mult}, got {mix_hc}"
 
-    if HAS_TRITON and mixes.is_cuda:
+    if HAS_TRITON and SUPPORT_FP8_TRITON and mixes.is_cuda:
         pre = torch.empty((B, S, hc_mult), dtype=torch.float32, device=mixes.device)
         post = torch.empty((B, S, hc_mult), dtype=torch.float32, device=mixes.device)
         comb = torch.empty((B, S, hc_mult, hc_mult), dtype=torch.float32, device=mixes.device)
