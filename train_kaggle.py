@@ -240,9 +240,15 @@ def stream_packed_tokens(
                 split=split,
                 token=hf_token,
             )
+            use_row_sharding = False
             if world_size > 1:
-                ds = ds.shard(num_shards=world_size, index=rank)
-            for row in ds:
+                if getattr(ds, "n_shards", 1) >= world_size:
+                    ds = ds.shard(num_shards=world_size, index=rank)
+                else:
+                    use_row_sharding = True
+            for row_idx, row in enumerate(ds):
+                if use_row_sharding and (row_idx % world_size) != rank:
+                    continue
                 # ── Universal schema → plain text ────────────────────
                 if "messages" in row:
                     msgs = row["messages"]
