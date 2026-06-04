@@ -559,7 +559,29 @@ class ElasticSparseConceptMemory(nn.Module):
             self.meta_centroids.data[block_idx].copy_(torch.mean(self.slot_db[block_idx], dim=0))
             
         # 4. Check for elastic spawn condition
-        if loss.item() > self.entropy_threshold and len(self.concept_blocks) < self.max_blocks:
+        # ── DDP-safe spawn gate ──────────────────────────────────────────────
+        # CRITICAL: Each rank may see a different `loss.item()` value (different
+        # micro-batch data). If we let each rank decide independently, one rank
+        # may spawn a new block (adding new parameters to DDP grad-sync) while
+        # the other does not → NCCL allreduce skew → 10-minute timeout crash.
+        #
+        # Fix: broadcast a single binary flag from Rank 0 so every rank makes
+        # the same spawn decision. This adds one tiny broadcast per HCM forward
+        # (negligible vs the allreduce-on-all-params cost).
+        should_spawn_local = (
+            loss.item() > self.entropy_threshold
+            and len(self.concept_blocks) < self.max_blocks
+        )
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            spawn_flag = torch.tensor(
+                int(should_spawn_local), dtype=torch.int32, device=loss.device
+            )
+            dist.broadcast(spawn_flag, src=0)
+            should_spawn = bool(spawn_flag.item())
+        else:
+            should_spawn = should_spawn_local
+
+        if should_spawn:
             # Freeze block
             for p in self.concept_blocks[block_idx].parameters():
                 p.requires_grad = False
