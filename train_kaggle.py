@@ -39,6 +39,8 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 import tiktoken
 from contextlib import nullcontext
 
@@ -135,18 +137,21 @@ class EMA:
     def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
         self.decay = decay
         self.shadow = {}
-        for name, param in model.named_parameters():
+        raw_model = model.module if hasattr(model, "module") else model
+        for name, param in raw_model.named_parameters():
             if param.requires_grad:
                 self.shadow[name] = param.data.clone()
 
     @torch.no_grad()
     def update(self, model: torch.nn.Module):
-        for name, param in model.named_parameters():
+        raw_model = model.module if hasattr(model, "module") else model
+        for name, param in raw_model.named_parameters():
             if param.requires_grad:
                 self.shadow[name].lerp_(param.data, 1.0 - self.decay)
 
     def swap(self, model: torch.nn.Module):
-        for name, param in model.named_parameters():
+        raw_model = model.module if hasattr(model, "module") else model
+        for name, param in raw_model.named_parameters():
             if param.requires_grad:
                 tmp = param.data.clone()
                 param.data.copy_(self.shadow[name])
@@ -218,7 +223,11 @@ def stream_packed_tokens(
     from datasets import load_dataset
 
     tag = label or dataset_name.split("/")[-1]
-    print(f"    [{tag}] opening stream (split={split})...", flush=True)
+    rank = int(os.environ.get("RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if rank == 0:
+        print(f"    [{tag}] opening stream (split={split})...", flush=True)
     eot = tokenizer.eot_token
     buf = []
 
@@ -231,6 +240,8 @@ def stream_packed_tokens(
                 split=split,
                 token=hf_token,
             )
+            if world_size > 1:
+                ds = ds.shard(num_shards=world_size, index=rank)
             for row in ds:
                 # ── Universal schema → plain text ────────────────────
                 if "messages" in row:
@@ -327,10 +338,11 @@ def save_checkpoint(
     path = os.path.join(ckpt_dir, name)
     latest = os.path.join(ckpt_dir, "lasmoid_latest.pt")
 
+    raw_model = model.module if hasattr(model, "module") else model
     blob = {
         "step": step,
         "tokens_seen": tokens_seen,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": raw_model.state_dict(),
         "opt_muon_state": opt_muon.state_dict(),
         "opt_adamw_state": opt_adamw.state_dict(),
         "model_args": model_args,
@@ -392,7 +404,8 @@ def load_checkpoint(model, opt_muon, opt_adamw, api, repo_id, hf_token, device):
         print(f"  [resume] downloading {fname}...", flush=True)
         path = hf_hub_download(repo_id=repo_id, filename=fname, token=hf_token)
         ckpt = torch.load(path, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        raw_model = model.module if hasattr(model, "module") else model
+        raw_model.load_state_dict(ckpt["model_state_dict"])
         opt_muon.load_state_dict(ckpt["opt_muon_state"])
         opt_adamw.load_state_dict(ckpt["opt_adamw_state"])
         step = ckpt["step"] + 1
@@ -522,32 +535,51 @@ def main():
     global _SESSION_LIMIT
     _SESSION_LIMIT = args.session_hours * 3600
 
-    # ── Device + AMP ─────────────────────────────────────────────────
-    device = (
-        "cuda"
-        if torch.cuda.is_available()
-        else "mps"
-        if torch.backends.mps.is_available()
-        else "cpu"
-    )
+    # ── DDP Setup ────────────────────────────────────────────────────
+    ddp = int(os.environ.get("RANK", -1)) != -1
+    if ddp:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+        ddp_rank = int(os.environ["RANK"])
+        ddp_local_rank = int(os.environ["LOCAL_RANK"])
+        ddp_world_size = int(os.environ["WORLD_SIZE"])
+        if torch.cuda.is_available():
+            device = f"cuda:{ddp_local_rank}"
+            torch.cuda.set_device(device)
+        else:
+            device = "cpu"
+        master_process = ddp_rank == 0
+    else:
+        ddp_rank = 0
+        ddp_local_rank = 0
+        ddp_world_size = 1
+        master_process = True
+        device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.backends.mps.is_available()
+            else "cpu"
+        )
+
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     amp_dtype = dtype_map[args.dtype]
-    use_amp = amp_dtype != torch.float32 and device in ("cuda", "mps")
+    use_amp = amp_dtype != torch.float32 and device.startswith("cuda")
     amp_ctx = (
         torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
-        if device == "cuda" and use_amp
-        else torch.amp.autocast(device_type="cpu", dtype=amp_dtype)
-        if device == "mps" and use_amp
+        if device.startswith("cuda") and use_amp
         else nullcontext()
     )
 
-    print(f"\n{'═' * 70}")
-    print(f"  LasmoidV1 Production Trainer v3")
-    print(f"  Device : {device.upper()} | AMP: {args.dtype}")
-    print(f"  Model  : {args.model_size} | theory903/Lasmoid-V1")
-    print(f"{'═' * 70}\n")
+    if master_process:
+        print(f"\n{'═' * 70}")
+        print(f"  LasmoidV1 Production Trainer v3")
+        print(f"  Device : {device.upper()} (DDP: {ddp}, World Size: {ddp_world_size}) | AMP: {args.dtype}")
+        print(f"  Model  : {args.model_size} | theory903/Lasmoid-V1")
+        print(f"{'═' * 70}\n")
 
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    if master_process:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
 
     # ── Model ─────────────────────────────────────────────────────────
     cfg = MODEL_CONFIGS[args.model_size].copy()
@@ -561,30 +593,39 @@ def main():
     total_str = f"{total_p / 1e6:.1f}M"
     chinchilla_tokens = int(total_p * 6.7)
 
-    print(f"  Parameters : {total_str} ({total_p:,})")
-    print(f"  Chinchilla-optimal tokens: {chinchilla_tokens / 1e9:.2f}B")
-    eff_batch = args.batch_size * args.grad_accum
+    if master_process:
+        print(f"  Parameters : {total_str} ({total_p:,})")
+        print(f"  Chinchilla-optimal tokens: {chinchilla_tokens / 1e9:.2f}B")
+    eff_batch = args.batch_size * args.grad_accum * ddp_world_size
     eff_tokens = eff_batch * model_args.max_seq_len
     total_toks = args.max_iters * eff_tokens
-    print(
-        f"  Training budget: {total_toks / 1e9:.2f}B tokens "
-        f"({total_toks / chinchilla_tokens * 100:.0f}% of Chinchilla-optimal)"
-    )
-    print(
-        f"  Effective batch: {eff_batch} seqs = {eff_tokens / 1000:.0f}K tokens/step\n"
-    )
+    if master_process:
+        print(
+            f"  Training budget: {total_toks / 1e9:.2f}B tokens "
+            f"({total_toks / chinchilla_tokens * 100:.0f}% of Chinchilla-optimal)"
+        )
+        print(
+            f"  Effective batch: {eff_batch} seqs = {eff_tokens / 1000:.0f}K tokens/step\n"
+        )
 
-    if args.compile and device == "cuda":
-        print("  torch.compile: enabled")
+    if args.compile and device.startswith("cuda"):
+        if master_process:
+            print("  torch.compile: enabled")
         model = torch.compile(model)
 
     if args.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
-        print("  Gradient checkpointing: enabled")
+        if master_process:
+            print("  Gradient checkpointing: enabled")
+
+    # Wrap model in DDP
+    if ddp:
+        model = DDP(model, device_ids=[ddp_local_rank])
 
     # ── Optimizers ────────────────────────────────────────────────────
     muon_params, adamw_params = [], []
-    for name, param in model.named_parameters():
+    raw_model = model.module if ddp else model
+    for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
         if (
@@ -597,8 +638,9 @@ def main():
         else:
             adamw_params.append(param)
 
-    print(f"  Muon  : {sum(q.numel() for q in muon_params) / 1e6:.1f}M params")
-    print(f"  AdamW : {sum(q.numel() for q in adamw_params) / 1e6:.1f}M params")
+    if master_process:
+        print(f"  Muon  : {sum(q.numel() for q in muon_params) / 1e6:.1f}M params")
+        print(f"  AdamW : {sum(q.numel() for q in adamw_params) / 1e6:.1f}M params")
 
     opt_muon = Muon(
         muon_params, lr=args.muon_lr, momentum=0.95, nesterov=True, ns_steps=5
@@ -615,13 +657,14 @@ def main():
     ema = None
     if args.ema_decay > 0:
         ema = EMA(model, decay=args.ema_decay)
-        print(f"  EMA  : decay={args.ema_decay}")
+        if master_process:
+            print(f"  EMA  : decay={args.ema_decay}")
 
     # ── HF Hub ────────────────────────────────────────────────────────
     hf_token = os.getenv("HF_TOKEN")
     api = repo_id = None
 
-    if hf_token and not args.dry_run:
+    if hf_token and not args.dry_run and master_process:
         try:
             from huggingface_hub import HfApi, login
 
@@ -847,11 +890,12 @@ def main():
         return 2
 
     # ── Training loop ─────────────────────────────────────────────────
-    print(f"\n  Starting: step {start_step:,} → {args.max_iters:,}")
-    print(
-        f"  Watchdog: exit after {args.session_hours:.1f}h "
-        f"(~{session_remaining_h():.1f}h remaining)\n"
-    )
+    if master_process:
+        print(f"\n  Starting: step {start_step:,} → {args.max_iters:,}")
+        print(
+            f"  Watchdog: exit after {args.session_hours:.1f}h "
+            f"(~{session_remaining_h():.1f}h remaining)\n"
+        )
 
     model.train()
     current_stage = get_stage(start_step, args.max_iters)
@@ -859,28 +903,32 @@ def main():
 
     # CSV metrics — one row per log interval for loss curve tracking
     log_file = os.path.join(args.checkpoint_dir, "training_metrics.csv")
-    if start_step == 0:
+    if master_process and start_step == 0:
         with open(log_file, "w") as f:
             f.write("step,loss,ce,mtp,z_loss,lr,tokens_seen,tok_per_sec,stage\n")
 
     for step in range(start_step, args.max_iters):
         # ── Watchdog ─────────────────────────────────────────────────
         if session_expired():
-            print(
-                f"\n⏰ {args.session_hours:.0f}h limit. Saving + exiting.", flush=True
-            )
-            save_checkpoint(
-                model,
-                opt_muon,
-                opt_adamw,
-                step,
-                args.checkpoint_dir,
-                model_args,
-                tokens_seen=tokens_seen,
-                api=api,
-                repo_id=repo_id,
-            )
-            print("Re-run Cell 6 to auto-resume from this step.", flush=True)
+            if master_process:
+                print(
+                    f"\n⏰ {args.session_hours:.0f}h limit. Saving + exiting.", flush=True
+                )
+                save_checkpoint(
+                    model,
+                    opt_muon,
+                    opt_adamw,
+                    step,
+                    args.checkpoint_dir,
+                    model_args,
+                    tokens_seen=tokens_seen,
+                    api=api,
+                    repo_id=repo_id,
+                )
+            if ddp:
+                dist.destroy_process_group()
+            if master_process:
+                print("Re-run Cell 6 to auto-resume from this step.", flush=True)
             sys.exit(0)
 
         # ── Curriculum stage switch ───────────────────────────────────
@@ -888,9 +936,10 @@ def main():
         if stage != current_stage and not args.dry_run:
             current_stage = stage
             loader.set_weights(STAGE_WEIGHTS[stage])
-            print(
-                f"\n  ▶ Curriculum → {STAGE_NAMES[stage]} at step {step:,}", flush=True
-            )
+            if master_process:
+                print(
+                    f"\n  ▶ Curriculum → {STAGE_NAMES[stage]} at step {step:,}", flush=True
+                )
 
         t0 = time.perf_counter()
 
@@ -922,35 +971,43 @@ def main():
         total_loss = total_ce = total_mtp = total_z = 0.0
 
         # ── Gradient accumulation ─────────────────────────────────────
-        for _ in range(args.grad_accum):
+        for micro_step in range(args.grad_accum):
             x, y = loader.next_batch()
 
-            with amp_ctx:
-                logits_nxt, logits_nxt2, _, _ = model(x, x)
-                z_loss = model.last_z_loss
+            # In DDP, only sync gradients on the last micro-step
+            if ddp and micro_step < args.grad_accum - 1:
+                ddp_ctx = model.no_sync()
+            else:
+                ddp_ctx = nullcontext()
 
-                ce = F.cross_entropy(
-                    logits_nxt.view(-1, model_args.vocab_size),
-                    y.view(-1),
-                    ignore_index=-1,
-                )
+            with ddp_ctx:
+                with amp_ctx:
+                    logits_nxt, logits_nxt2, _, _ = model(x, x)
+                    raw_model = model.module if ddp else model
+                    z_loss = raw_model.last_z_loss
 
-                mtp = torch.tensor(0.0, device=device)
-                if logits_nxt2 is not None:
-                    mtp = F.cross_entropy(
-                        logits_nxt2[:, :-1]
-                        .contiguous()
-                        .view(-1, model_args.vocab_size),
-                        y[:, 1:].contiguous().view(-1),
+                    ce = F.cross_entropy(
+                        logits_nxt.view(-1, model_args.vocab_size),
+                        y.view(-1),
                         ignore_index=-1,
                     )
 
-                loss = (
-                    ce + args.mtp_coeff * mtp + model_args.router_z_loss_coeff * z_loss
-                )
-                loss = loss / args.grad_accum
+                    mtp = torch.tensor(0.0, device=device)
+                    if logits_nxt2 is not None:
+                        mtp = F.cross_entropy(
+                            logits_nxt2[:, :-1]
+                            .contiguous()
+                            .view(-1, model_args.vocab_size),
+                            y[:, 1:].contiguous().view(-1),
+                            ignore_index=-1,
+                        )
 
-            loss.backward()  # bf16 — no scaler needed
+                    loss = (
+                        ce + args.mtp_coeff * mtp + model_args.router_z_loss_coeff * z_loss
+                    )
+                    loss = loss / args.grad_accum
+
+                loss.backward()  # bf16 — no scaler needed
 
             total_loss += loss.item() * args.grad_accum
             total_ce += ce.item()
@@ -978,7 +1035,7 @@ def main():
         running["n"] += 1
 
         # ── Logging ──────────────────────────────────────────────────
-        if step % args.log_interval == 0:
+        if master_process and step % args.log_interval == 0:
             n = running["n"]
             tps = (eff_tokens * n) / running["dt"]  # tokens / sec
             chin_pct = tokens_seen / chinchilla_tokens * 100
@@ -1030,7 +1087,7 @@ def main():
             running["n"] = 0
 
         # ── Checkpoint ───────────────────────────────────────────────
-        if step > 0 and step % args.save_interval == 0:
+        if master_process and step > 0 and step % args.save_interval == 0:
             save_checkpoint(
                 model,
                 opt_muon,
@@ -1045,22 +1102,26 @@ def main():
             )
 
     # ── Final ─────────────────────────────────────────────────────────
-    save_checkpoint(
-        model,
-        opt_muon,
-        opt_adamw,
-        args.max_iters,
-        args.checkpoint_dir,
-        model_args,
-        tokens_seen=tokens_seen,
-        metrics={"final": True, "total_tokens": tokens_seen},
-        api=api,
-        repo_id=repo_id,
-    )
-    print(
-        f"\n✅ Training complete! Total tokens seen: {tokens_seen / 1e9:.2f}B",
-        flush=True,
-    )
+    if master_process:
+        save_checkpoint(
+            model,
+            opt_muon,
+            opt_adamw,
+            args.max_iters,
+            args.checkpoint_dir,
+            model_args,
+            tokens_seen=tokens_seen,
+            metrics={"final": True, "total_tokens": tokens_seen},
+            api=api,
+            repo_id=repo_id,
+        )
+        print(
+            f"\n✅ Training complete! Total tokens seen: {tokens_seen / 1e9:.2f}B",
+            flush=True,
+        )
+
+    if ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
