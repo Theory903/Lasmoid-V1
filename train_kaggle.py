@@ -38,11 +38,14 @@ import os, sys, time, math, random, argparse
 if "--data_check" in sys.argv:
     # Disable CUDA for the data check process to prevent CUDA + fork SIGABRT
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    print("[DEBUG] Entered --data_check block. CUDA disabled.", flush=True)
     is_master = int(os.environ.get("RANK", 0)) == 0
     if is_master:
+        print("[DEBUG] Master process confirmed. Importing datasets...", flush=True)
         from datasets import load_dataset
+        print("[DEBUG] datasets imported successfully.", flush=True)
         _hf_token = os.getenv("HF_TOKEN")
-        print("\n  Data check mode — verifying all 8 streams\n")
+        print("\n  Data check mode — verifying all 8 streams\n", flush=True)
         stream_infos = [
             (
                 "UltraFineWeb",
