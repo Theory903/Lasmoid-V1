@@ -42,7 +42,7 @@ class Muon(torch.optim.Optimizer):
                         A = X @ X.T
                         B = A @ X
                         X = a * X + b * B + c * A @ B
-                    update = X * (G.norm() + 1e-8)
+                    update = X * (max(p.shape[0], p.shape[1]) ** 0.5)
                     if transposed:
                         update = update.T
                 else:

@@ -167,7 +167,7 @@ class Muon(torch.optim.Optimizer):
                     for _ in range(g["ns_steps"]):
                         A = X @ X.T
                         X = self._A * X + self._B * (A @ X) + self._C * (A @ A @ X)
-                    update = X * (update.norm() + 1e-8)
+                    update = X * (max(p.shape[0], p.shape[1]) ** 0.5)
                     if transposed:
                         update = update.T
 
