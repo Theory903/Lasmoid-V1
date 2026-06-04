@@ -811,6 +811,8 @@ def main():
             except Exception as e:
                 print(f"    ERROR: {e}")
         print("\n  All stream checks complete ✓")
+        if dist.is_initialized():
+            dist.destroy_process_group()
         return
     else:
         tok = tiktoken.get_encoding("gpt2")
