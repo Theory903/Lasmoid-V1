@@ -33,6 +33,10 @@ Dataset curriculum (inspired by Llama-3, Phi-4, YuLan-Mini):
 """
 
 import os, sys, time, math, random, argparse
+
+# Prevent CUDA memory fragmentation on Kaggle T4 (16GB)
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
 import torch
 import torch.nn.functional as F
 import tiktoken

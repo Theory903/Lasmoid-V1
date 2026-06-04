@@ -777,19 +777,21 @@ class MHCBlock(nn.Module):
         V4-Pro Block.hc_pre() exact port.
         x: (B, S, hc, D)  →  layer_input: (B, S, D), post, comb
         """
-        shape, dtype = x.size(), x.dtype
-        B, S, hc, D  = shape
-        x_flat = x.flatten(2).float()                                  # (B, S, hc*D)
-        rsqrt  = torch.rsqrt(x_flat.square().mean(-1, keepdim=True) + self.hc_eps)
-        mixes  = F.linear(x_flat, self.hc_fn.float()) * rsqrt         # (B, S, mix_hc)
+        dtype = x.dtype
+        B, S, hc, D = x.size()
+        x_flat = x.flatten(2)                                # (B, S, hc*D)
+        mean_sq = x_flat.square().mean(-1, keepdim=True).float()
+        rsqrt  = torch.rsqrt(mean_sq + self.hc_eps).to(dtype)
+        mixes  = F.linear(x_flat, self.hc_fn.to(dtype)) * rsqrt         # (B, S, mix_hc)
 
         pre, post, comb = hc_split_sinkhorn(
-            mixes, self.hc_scale.float(), self.hc_base.float(),
+            mixes.float(), self.hc_scale.float(), self.hc_base.float(),
             self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps,
         )
-        # Weighted sum of hc streams → single layer input (V4-Pro line 680)
-        y = torch.sum(pre.unsqueeze(-1) * x_flat.view(shape), dim=2)  # (B, S, D)
-        return y.to(dtype), post, comb
+        # Weighted sum of hc streams → single layer input
+        # Using x directly in input dtype avoids redundant float32 conversions
+        y = torch.sum(pre.to(dtype).unsqueeze(-1) * x, dim=2)  # (B, S, D)
+        return y, post, comb
 
     def hc_post(
         self,
@@ -803,9 +805,10 @@ class MHCBlock(nn.Module):
         x: (B,S,D), residual: (B,S,hc,D), post: (B,S,hc), comb: (B,S,hc,hc)
         → (B,S,hc,D)
         """
-        # Batched matmul (was broadcast OOM at ~192 MiB float32 intermediate)
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(comb.bfloat16(), residual)
-        return y.type_as(x)
+        dtype = x.dtype
+        # Keep operations in input dtype to avoid float32 promotion
+        y = post.to(dtype).unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(comb.to(dtype), residual)
+        return y
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -881,14 +884,14 @@ class MTPBlock(nn.Module):
         """V4-Pro ParallelHead.hc_head: sigmoid-based hc → single stream."""
         shape, dtype = x.size(), x.dtype
         B, S, hc, D  = shape
-        xf    = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6)
-        mixes = F.linear(xf, self.hc_head_fn.float()) * rsqrt
-        pre   = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + 1e-6
-        y     = torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=2)
-        return y.to(dtype)
+        xf    = x.flatten(2)
+        mean_sq = xf.square().mean(-1, keepdim=True).float()
+        rsqrt = torch.rsqrt(mean_sq + 1e-6).to(dtype)
+        mixes = F.linear(xf, self.hc_head_fn.to(dtype)) * rsqrt
+        pre   = torch.sigmoid(mixes.float() * self.hc_head_scale + self.hc_head_base) + 1e-6
+        y     = torch.sum(pre.to(dtype).unsqueeze(-1) * x, dim=2)
+        return y
 
-    @torch.inference_mode()
     def forward(
         self,
         x: torch.Tensor,         # (B, S, hc, D) — current hidden state
@@ -970,19 +973,24 @@ class LasmoidV1(nn.Module):
             persistent=False,
         )
 
+        self.gradient_checkpointing = False
         self.last_z_loss = torch.tensor(0.0)
         self.last_commit_loss = torch.tensor(0.0)
+
+    def gradient_checkpointing_enable(self, **kwargs):
+        self.gradient_checkpointing = True
 
     def _hc_head_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """HC head: sigmoid-based weighted sum over hc streams."""
         shape, dtype = x.size(), x.dtype
         B, S, hc, D  = shape
-        xf    = x.flatten(2).float()
-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6)
-        mixes = F.linear(xf, self.hc_head_fn.float()) * rsqrt
-        pre   = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + 1e-6
-        y     = torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=2)
-        return y.to(dtype)
+        xf    = x.flatten(2)
+        mean_sq = xf.square().mean(-1, keepdim=True).float()
+        rsqrt = torch.rsqrt(mean_sq + 1e-6).to(dtype)
+        mixes = F.linear(xf, self.hc_head_fn.to(dtype)) * rsqrt
+        pre   = torch.sigmoid(mixes.float() * self.hc_head_scale + self.hc_head_base) + 1e-6
+        y     = torch.sum(pre.to(dtype).unsqueeze(-1) * x, dim=2)
+        return y
 
     def forward(
         self,
@@ -1025,7 +1033,22 @@ class LasmoidV1(nn.Module):
 
         total_z_loss = torch.tensor(0.0, device=x_dec.device, dtype=torch.float32)
         for layer in self.layers:
-            streams, z_loss = layer(streams, freqs_cis_dec, start_pos, x_dec, concept_db)
+            if self.gradient_checkpointing and self.training:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+                streams, z_loss = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(layer),
+                    streams,
+                    freqs_cis_dec,
+                    start_pos,
+                    x_dec,
+                    concept_db,
+                    use_reentrant=False,
+                )
+            else:
+                streams, z_loss = layer(streams, freqs_cis_dec, start_pos, x_dec, concept_db)
             total_z_loss = total_z_loss + z_loss
         self.last_z_loss = total_z_loss
 
