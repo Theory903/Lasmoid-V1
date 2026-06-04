@@ -36,6 +36,8 @@ import os, sys, time, math, random, argparse
 
 # ── Early data_check exit (MUST run before importing torch/initializing CUDA) ──
 if "--data_check" in sys.argv:
+    # Disable CUDA for the data check process to prevent CUDA + fork SIGABRT
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
     is_master = int(os.environ.get("RANK", 0)) == 0
     if is_master:
         from datasets import load_dataset
