@@ -401,45 +401,52 @@ class MLA(nn.Module):
         # q: (B,N,H,D) → (B,H,N,D);  kv_cache as K=V: (B,N,D) → expand heads
         q_t  = q.transpose(1, 2)                                        # (B,H,N,D)
         
-        # Prepare custom attention mask for causal token + full concept attention
-        is_causal = (start_pos == 0 and N > 1 and concept_db is None)
+        # Prepare custom attention mask for causal token + full concept attention + block-diagonal packing
+        is_causal = (start_pos == 0 and N > 1 and concept_db is None and cu_seqlens is None)
         attn_mask = None
-        if start_pos == 0 and N > 1 and concept_db is not None:
-            Seq_combined = K_combined.size(1)
-            Seq_token = K_cache.size(1)
-            mask = torch.ones(N, Seq_combined, dtype=torch.bool, device=x.device)
-            causal_mask = torch.triu(torch.ones(N, N, dtype=torch.bool, device=x.device), diagonal=1)
-            mask[:, :N] = causal_mask
-            if Seq_token > N:
-                mask[:, N:Seq_token] = True
-            mask[:, Seq_token:] = False
-            
-            # Apply block diagonal masking if cu_seqlens is provided
-            if cu_seqlens is not None:
-                for b in range(B):
-                    # We process each batch item's sequence masking
-                    # Since cu_seqlens is [Batch, Num_Docs+1], we zero out cross-doc attention
-                    doc_boundaries = cu_seqlens[b]
-                    for i in range(len(doc_boundaries) - 1):
-                        start_idx = doc_boundaries[i].item()
-                        end_idx = doc_boundaries[i+1].item()
-                        if start_idx >= N: continue
-                        
-                        # Zero out attention from this doc to tokens outside this doc
-                        # Note: we still allow attention to the concept_db (if any)
-                        mask[start_idx:end_idx, :start_idx] = False
-                        if end_idx < N:
-                            mask[start_idx:end_idx, end_idx:N] = False
+        
+        if start_pos == 0 and N > 1:
+            if concept_db is not None or cu_seqlens is not None:
+                Seq_combined = K_combined.size(1)
+                Seq_token = K_cache.size(1)
+                
+                # Use a 3D mask (B, N, Seq_combined) to allow batch-specific block-diagonal masks
+                mask = torch.ones(B, N, Seq_combined, dtype=torch.bool, device=x.device)
+                
+                # Causal mask base
+                causal_mask = torch.triu(torch.ones(N, N, dtype=torch.bool, device=x.device), diagonal=1)
+                mask[:, :, :N] = causal_mask.unsqueeze(0)
+                
+                if Seq_token > N:
+                    mask[:, :, N:Seq_token] = True
+                if Seq_combined > Seq_token:
+                    mask[:, :, Seq_token:] = False
+                
+                # Apply block diagonal masking if cu_seqlens is provided
+                if cu_seqlens is not None:
+                    for b in range(B):
+                        doc_boundaries = cu_seqlens[b]
+                        for i in range(len(doc_boundaries) - 1):
+                            start_idx = doc_boundaries[i].item()
+                            end_idx = doc_boundaries[i+1].item()
+                            if start_idx >= N: continue
                             
-            attn_mask = mask
+                            # Zero out (set to False/allow) attention outside current document boundary
+                            # In PyTorch masked_fill, True means mask out (exclude), False means keep (allow)
+                            # Our causal_mask is True for masked out values. So we set cross-doc paths to True (masked out).
+                            mask[b, start_idx:end_idx, :start_idx] = True
+                            if end_idx < N:
+                                mask[b, start_idx:end_idx, end_idx:N] = True
+                                
+                attn_mask = mask
 
         kv_h = K_combined.unsqueeze(1).expand(-1, self.n_heads, -1, -1).to(q_t.dtype)  # (B,H,Seq_combined,D)
         
         if attn_mask is not None:
             # Explicit manual attention computation to avoid MPS bug with custom boolean masks
             scores = torch.matmul(q_t.float(), kv_h.transpose(-2, -1).float()) * self.softmax_scale
-            # Apply attention mask: fill True positions with -10000.0
-            scores = scores.masked_fill(attn_mask.unsqueeze(0).unsqueeze(1), -10000.0)
+            # Apply attention mask: fill True positions with -10000.0 (attn_mask is B, N, Seq_combined, we unsqueeze to broadcast with H)
+            scores = scores.masked_fill(attn_mask.unsqueeze(1), -10000.0)
             probs = torch.softmax(scores, dim=-1).to(q_t.dtype)
             attn_out = torch.matmul(probs, kv_h)
         else:

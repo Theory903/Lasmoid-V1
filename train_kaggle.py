@@ -759,6 +759,8 @@ def main():
     )
 
     # ── Data Streams ──────────────────────────────────────────────────
+    tok = tiktoken.get_encoding("gpt2")
+
     if args.dry_run:
         print("\n  Dry run: mock data\n")
 
@@ -769,7 +771,7 @@ def main():
                     for _ in range(args.seq_len + 1)
                 ]
 
-        loader = MultiTaskLoader([_mock()], [1.0], args.batch_size, device, eot_id=tokenizer.eos_token_id)
+        loader = MultiTaskLoader([_mock()], [1.0], args.batch_size, device, eot_id=tok.eot_token)
         STAGE_WEIGHTS = [[1.0], [1.0], [1.0]]
     elif args.data_check:
         print("\n  Data check mode — verifying all 8 streams\n")
@@ -943,7 +945,7 @@ def main():
                 f"    [Stage 3  90%→100%] SFT 40% (IF 20+math 15+code 5) | CoT 35% | mythos 25%  (pure quality)"
             )
 
-        loader = MultiTaskLoader(STREAMS, STAGE_WEIGHTS[0], args.batch_size, device, eot_id=tokenizer.eos_token_id)
+        loader = MultiTaskLoader(STREAMS, STAGE_WEIGHTS[0], args.batch_size, device, eot_id=tok.eot_token)
         
     if args.phase in ["rl", "fst"]:
         from fst_trainer import GEPAMutator
