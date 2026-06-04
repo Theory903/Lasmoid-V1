@@ -328,6 +328,7 @@ class MLA(nn.Module):
         freqs_cis: torch.Tensor,
         start_pos: int = 0,
         concept_db: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, N, _ = x.shape
         win = self.kv_cache.shape[1]
@@ -412,6 +413,24 @@ class MLA(nn.Module):
             if Seq_token > N:
                 mask[:, N:Seq_token] = True
             mask[:, Seq_token:] = False
+            
+            # Apply block diagonal masking if cu_seqlens is provided
+            if cu_seqlens is not None:
+                for b in range(B):
+                    # We process each batch item's sequence masking
+                    # Since cu_seqlens is [Batch, Num_Docs+1], we zero out cross-doc attention
+                    doc_boundaries = cu_seqlens[b]
+                    for i in range(len(doc_boundaries) - 1):
+                        start_idx = doc_boundaries[i].item()
+                        end_idx = doc_boundaries[i+1].item()
+                        if start_idx >= N: continue
+                        
+                        # Zero out attention from this doc to tokens outside this doc
+                        # Note: we still allow attention to the concept_db (if any)
+                        mask[start_idx:end_idx, :start_idx] = False
+                        if end_idx < N:
+                            mask[start_idx:end_idx, end_idx:N] = False
+                            
             attn_mask = mask
 
         kv_h = K_combined.unsqueeze(1).expand(-1, self.n_heads, -1, -1).to(q_t.dtype)  # (B,H,Seq_combined,D)
@@ -905,11 +924,12 @@ class LasmoidBlock(nn.Module):
         start_pos: int = 0,
         input_ids: Optional[torch.Tensor] = None,
         concept_db: Optional[torch.Tensor] = None,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # ATTN HC (V4-Pro Block.forward lines 690-693)
         residual = streams
         attn_in, post, comb = self.hc_attn.hc_pre(streams)
-        attn_out = self.attn(self.attn_norm(attn_in), freqs_cis, start_pos, concept_db)
+        attn_out = self.attn(self.attn_norm(attn_in), freqs_cis, start_pos, concept_db, cu_seqlens=cu_seqlens)
         streams  = self.hc_attn.hc_post(attn_out, residual, post, comb)
 
         # FFN HC (V4-Pro Block.forward lines 695-699)
@@ -1098,6 +1118,7 @@ class LasmoidV1(nn.Module):
         concept_db: Optional[torch.Tensor] = None,
         memory_state: Optional[torch.Tensor] = None,
         start_pos: int = 0,
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         CQRS forward pass:
@@ -1144,10 +1165,11 @@ class LasmoidV1(nn.Module):
                     start_pos,
                     x_dec,
                     concept_db,
+                    cu_seqlens,
                     use_reentrant=False,
                 )
             else:
-                streams, z_loss = layer(streams, freqs_cis_dec, start_pos, x_dec, concept_db)
+                streams, z_loss = layer(streams, freqs_cis_dec, start_pos, x_dec, concept_db, cu_seqlens=cu_seqlens)
             total_z_loss = total_z_loss + z_loss
         self.last_z_loss = total_z_loss
 

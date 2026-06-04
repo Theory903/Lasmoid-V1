@@ -1,0 +1,270 @@
+
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:var(--font-sans)}
+.wrap{padding:1.5rem 0;max-width:100%}
+.summary-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin-bottom:1.5rem}
+.metric{background:var(--color-background-secondary);border-radius:var(--border-radius-md);padding:12px 14px}
+.metric-label{font-size:12px;color:var(--color-text-secondary);margin-bottom:4px}
+.metric-val{font-size:22px;font-weight:500}
+.metric-val.critical{color:#A32D2D}
+.metric-val.warn{color:#854F0B}
+.metric-val.info{color:#185FA5}
+.metric-val.ok{color:#3B6D11}
+.section{margin-bottom:1.25rem;border:0.5px solid var(--color-border-tertiary);border-radius:var(--border-radius-lg);overflow:hidden}
+.section-header{display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;background:var(--color-background-secondary);user-select:none}
+.badge{font-size:11px;font-weight:500;padding:2px 8px;border-radius:999px}
+.badge.critical{background:#FCEBEB;color:#A32D2D}
+.badge.warn{background:#FAEEDA;color:#854F0B}
+.badge.info{background:#E6F1FB;color:#185FA5}
+.badge.logic{background:#EEEDFE;color:#534AB7}
+.section-title{font-size:14px;font-weight:500;flex:1}
+.chevron{font-size:13px;color:var(--color-text-secondary);transition:transform 0.15s}
+.chevron.open{transform:rotate(180deg)}
+.issues{padding:0 14px 4px}
+.issue{border-top:0.5px solid var(--color-border-tertiary);padding:10px 0}
+.issue:first-child{border-top:none;padding-top:14px}
+.issue-row{display:flex;gap:8px;align-items:flex-start}
+.sev-dot{width:8px;height:8px;border-radius:50%;margin-top:5px;flex-shrink:0}
+.sev-dot.critical{background:#E24B4A}
+.sev-dot.warn{background:#BA7517}
+.sev-dot.info{background:#378ADD}
+.sev-dot.logic{background:#7F77DD}
+.issue-body{flex:1}
+.issue-title{font-size:13px;font-weight:500;color:var(--color-text-primary);margin-bottom:3px}
+.issue-desc{font-size:12px;color:var(--color-text-secondary);line-height:1.55;margin-bottom:4px}
+.code{font-family:var(--font-mono);font-size:11px;background:var(--color-background-secondary);border-radius:4px;padding:5px 8px;color:var(--color-text-primary);border:0.5px solid var(--color-border-tertiary);white-space:pre-wrap;margin-top:4px}
+.loc{font-size:11px;color:var(--color-text-tertiary)}
+</style>
+<div class="wrap">
+<h2 style="sr-only">LasmoidV1 Code Audit</h2>
+
+<div class="summary-grid">
+  <div class="metric"><div class="metric-label">Critical bugs</div><div class="metric-val critical">4</div></div>
+  <div class="metric"><div class="metric-label">Logic errors</div><div class="metric-val warn">5</div></div>
+  <div class="metric"><div class="metric-label">Design issues</div><div class="metric-val info">6</div></div>
+  <div class="metric"><div class="metric-label">Files reviewed</div><div class="metric-val ok">7</div></div>
+</div>
+
+<div class="section" id="s1">
+  <div class="section-header" onclick="toggle('s1')">
+    <span class="badge critical">CRITICAL</span>
+    <span class="section-title">model.py — Runtime crashes &amp; correctness bugs</span>
+    <span class="chevron" id="c-s1">▼</span>
+  </div>
+  <div class="issues" id="b-s1">
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot critical"></div>
+        <div class="issue-body">
+          <div class="issue-title">act_quant return discarded in KV path — result never used</div>
+          <div class="issue-desc">Line 351 calls act_quant() in inplace=True mode and discards the return value. This is a no-op — the quantisation noise is written into a temporary contiguous copy, not into kv itself. The intended QAT simulation never applies.</div>
+          <div class="code">act_quant(kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype, True)
+# .contiguous() creates a new tensor. inplace writes into THAT copy, not kv.
+# Fix: kv[..., :-self.rope_head_dim] = act_quant(...).contiguous()</div>
+          <div class="loc">model.py:351, also :379</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot critical"></div>
+        <div class="issue-body">
+          <div class="issue-title">ElasticSparseConceptMemory: slot_db indexed with scalar block_idx but always has batch dim 1</div>
+          <div class="issue-desc">Line 556: self.slot_db.data[block_idx] attempts to index a tensor of shape (1, num_concepts, dim) with block_idx. This works only when block_idx==0 and slot_db has exactly 1 entry. After any elastic spawn, slot_db grows to (N, num_concepts, dim) but process_chunk always calls with block_idx=0, so newly spawned blocks are never actually trained on.</div>
+          <div class="code">self.slot_db.data[block_idx].copy_(self.slot_ema.data[0])
+# If block_idx > 0 but slot_db was just extended to that size, 
+# it still works — but process_chunk recursively calls block_idx+1 BEFORE
+# the buffer is extended. The recursive call at line 604 passes block_idx+1 
+# and then tries to access concept_blocks[block_idx+1] which was just appended,
+# but slot_db isn't extended yet at that point in the recursive call.</div>
+          <div class="loc">model.py:556, 591-604</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot critical"></div>
+        <div class="issue-body">
+          <div class="issue-title">MTPBlock.forward: hnorm applied to 4D stream but enorm applied to 2D embedding — dim mismatch on add</div>
+          <div class="issue-desc">Line 957: self.h_proj(h) operates on h = self.hnorm(x) where x is (B,S,hc,D). hnorm is an RMSNorm(dim) which expects a (..., D) tensor — this implicitly flattens the hc dimension. Then e_proj(e) is (B,S,1,D) after unsqueeze(2), and h is (B,S,hc,D). The add broadcasts fine but the semantics are wrong: hc streams are all projected the same way, defeating the multi-stream purpose.</div>
+          <div class="code">e = self.enorm(self.embed(input_ids).to(x.dtype))   # (B,S,D)
+h = self.hnorm(x)  # x is (B,S,hc,D) — hnorm dim=args.dim, normalises last dim only
+x = self.e_proj(e).unsqueeze(2) + self.h_proj(h)  # h_proj input shape wrong</div>
+          <div class="loc">model.py:954-957</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot critical"></div>
+        <div class="issue-body">
+          <div class="issue-title">generate(): start_pos never advances past max_len — all decode steps overwrite position max_len</div>
+          <div class="issue-desc">In model.generate() (line 1162), current_pos starts at actual_max_len and increments by 1 per step. But the KV cache write at line 369 does self.kv_cache[:B, start_pos % win] = kv[:, 0], where win=128. If max_len=256 and win=128, start_pos % win immediately wraps back to 0, overwriting the beginning of the cache for every decode step from step 128 onward.</div>
+          <div class="code">self.kv_cache[:B, start_pos % win] = kv[:, 0]
+# With max_seq_len=256, window_size=128:
+# start_pos=256 → index 0, start_pos=257 → index 1 (overwrites prefill KV!)</div>
+          <div class="loc">model.py:369, 1162-1183</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" id="s2">
+  <div class="section-header" onclick="toggle('s2')">
+    <span class="badge warn">LOGIC</span>
+    <span class="section-title">model.py — Logic errors and silent misbehaviours</span>
+    <span class="chevron" id="c-s2">▼</span>
+  </div>
+  <div class="issues" id="b-s2">
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot logic"></div>
+        <div class="issue-body">
+          <div class="issue-title">Weight tying breaks FP8 scale parameter — head.weight.scale is lost</div>
+          <div class="issue-desc">Line 994: self.head.weight = self.emb.weight replaces the Linear's nn.Parameter with the Embedding's weight, which has no .scale attribute. fp8_gemm / _linear_dispatch subsequently tries to access weight.scale and raises AttributeError at inference with dtype="fp8".</div>
+          <div class="code">self.head.weight = self.emb.weight  # emb.weight is a plain Parameter, no .scale
+# In _linear_dispatch line 166: fp8_gemm(xq, xs, weight, weight.scale, ...)  ← AttributeError</div>
+          <div class="loc">model.py:994</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot logic"></div>
+        <div class="issue-body">
+          <div class="issue-title">DRY penalty match_len walk condition is off-by-one — never triggers at the minimum length</div>
+          <div class="issue-desc">generate.py line 79: the while-loop guard is match_len &lt; dry_allowed_length, so it stops growing when match_len equals dry_allowed_length-1. The subsequent check if match_len &lt; dry_allowed_length then always skips it. A match of exactly dry_allowed_length=2 tokens is never penalised unless the sequence is longer.</div>
+          <div class="code">while (match_len < dry_allowed_length and ...):  # stops at match_len == 1 (when allowed=2)
+    match_len += 1
+if match_len < dry_allowed_length:  # match_len == 1, still skips when allowed==2
+    continue
+# Fix: while guard should be match_len <= dry_allowed_length</div>
+          <div class="loc">generate.py:79-85</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot logic"></div>
+        <div class="issue-body">
+          <div class="issue-title">_apply_top_p returns log-probabilities but subsequent filters expect raw logits</div>
+          <div class="issue-desc">Line 165: logits = filtered.log() converts to log-space. But _apply_top_k (called next in _full_sample) thresholds using raw logit values. All log-probs are ≤0 while raw logits can be large positive, so top_k effectively becomes a no-op after top_p is applied.</div>
+          <div class="code">logits = filtered.log()  # now ≤ 0 everywhere
+# then _apply_top_k compares against top_k-th raw logit — semantically broken</div>
+          <div class="loc">generate.py:165, 211-217</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot warn"></div>
+        <div class="issue-body">
+          <div class="issue-title">train.py MTP loss: yb[:, 1:] is (B, N-1) but logits_next_next is (B, N, vocab) — shape mismatch</div>
+          <div class="issue-desc">Line 72 in train.py: F.cross_entropy(logits_next_next.view(-1, vocab), yb[:, 1:].contiguous().view(-1)). logits has B*N rows, yb[:,1:] has B*(N-1) rows. This raises a size mismatch error at runtime whenever grad_accum > 0 and N > 1.</div>
+          <div class="code">ce_loss_mtp = F.cross_entropy(
+    logits_next_next.view(-1, model_args.vocab_size),  # B*N rows
+    yb[:, 1:].contiguous().view(-1)                   # B*(N-1) rows — MISMATCH
+)</div>
+          <div class="loc">train.py:72</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot warn"></div>
+        <div class="issue-body">
+          <div class="issue-title">GraphVectorQuantizer adjacency is (codebook_size × codebook_size) softmax but gradient of 256×256 dense matrix is O(n²) — unusable at scale</div>
+          <div class="issue-desc">The full dense adjacency matrix at line 450 is 256×256 = 65k parameters softmaxed on every forward pass. For codebook_size=1024 this becomes 1M params softmaxed per token per layer. No gradient truncation or sparse masking. This is a scaling time-bomb.</div>
+          <div class="loc">model.py:450-472</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" id="s3">
+  <div class="section-header" onclick="toggle('s3')">
+    <span class="badge info">DESIGN</span>
+    <span class="section-title">Architecture &amp; design concerns</span>
+    <span class="chevron" id="c-s3">▼</span>
+  </div>
+  <div class="issues" id="b-s3">
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot info"></div>
+        <div class="issue-body">
+          <div class="issue-title">MLA uses a single shared KV projection (wkv) — not true MLA</div>
+          <div class="issue-desc">Real MLA (as in DeepSeek-V2) uses separate wkv_a (down-projection to latent) and wkv_b (up-projection to full KV per head). This implementation compresses to a single head_dim vector and uses it as K=V for all heads simultaneously. This is closer to Multi-Query Attention (MQA) with a shared key-value, not MLA.</div>
+          <div class="loc">model.py:304-349</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot info"></div>
+        <div class="issue-body">
+          <div class="issue-title">ElasticSparseConceptMemory: n_heads=8 hardcoded — breaks if dim is not divisible by 8</div>
+          <div class="issue-desc">Line 537: n_heads = 8 is hardcoded inside process_chunk. If dim=128 this gives head_dim=16, which works. But any dim not divisible by 8 (e.g. dim=96) silently produces a wrong reshape without an error until the view call fails.</div>
+          <div class="code">n_heads = 8  # hardcoded — should be a ModelArgs parameter</div>
+          <div class="loc">model.py:537</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot info"></div>
+        <div class="issue-body">
+          <div class="issue-title">Elastic spawn recursion can stack-overflow with high entropy — no depth guard</div>
+          <div class="issue-desc">process_chunk calls itself recursively when loss > entropy_threshold (line 604). In early training when all losses are high, this will recurse until max_blocks is hit. But if the recursive call itself triggers another spawn before max_blocks is checked, the ModuleList could grow unboundedly before the guard fires. Also, Python recursion limit is 1000.</div>
+          <div class="loc">model.py:571-604</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot info"></div>
+        <div class="issue-body">
+          <div class="issue-title">generate.py: batch generation processes prompts serially — no actual batching</div>
+          <div class="issue-desc">The generate() function loops over prompt_tokens one at a time (line 256: for tokens_list in prompt_tokens). Each prompt does a separate forward pass. The max_batch_size parameter in ModelArgs is therefore meaningless in inference — no speedup from batching.</div>
+          <div class="loc">generate.py:256</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot info"></div>
+        <div class="issue-body">
+          <div class="issue-title">fp8_cast_bf16.py: LRU eviction pops the earliest key — dict ordering not guaranteed pre-3.7</div>
+          <div class="issue-desc">Line 82: oldest = next(iter(loaded_files)) works only because CPython 3.7+ dicts preserve insertion order. The comment says "2-file LRU" but this is actually FIFO, not LRU. A file loaded twice (referenced by two shards) could still be evicted while still needed.</div>
+          <div class="loc">fp8_cast_bf16.py:82</div>
+        </div>
+      </div>
+    </div>
+    <div class="issue">
+      <div class="issue-row">
+        <div class="sev-dot info"></div>
+        <div class="issue-body">
+          <div class="issue-title">kernel.py: sparse_attn attention sink is noted as "approximate" and never actually applied</div>
+          <div class="issue-desc">Lines 362-364 explicitly comment that the full attn_sink implementation is skipped ("We approximate by keeping softmax as-is"). This means the attn_sink learnable parameter in MLA (line 314 of model.py) receives no gradient signal — it's allocated, loaded in checkpoints, but has no effect on outputs.</div>
+          <div class="loc">kernel.py:362-364, model.py:314</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p style="font-size:12px;color:var(--color-text-tertiary);padding-top:8px">Click any section header to collapse. All file:line references are exact.</p>
+</div>
+
+<script>
+function toggle(id){
+  const body=document.getElementById('b-'+id);
+  const chev=document.getElementById('c-'+id);
+  const open=body.style.display!=='none';
+  body.style.display=open?'none':'block';
+  chev.textContent=open?'▶':'▼';
+  if(open)chev.classList.remove('open');else chev.classList.add('open');
+}
+</script>

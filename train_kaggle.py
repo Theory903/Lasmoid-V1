@@ -233,7 +233,7 @@ def stream_packed_tokens(
 
     if rank == 0:
         print(f"    [{tag}] opening stream (split={split})...", flush=True)
-    eot = tokenizer.eot_token
+    eot = tokenizer.eos_token_id
     buf = []
 
     while True:
@@ -308,10 +308,11 @@ def stream_packed_tokens(
 class MultiTaskLoader:
     """Weighted stochastic batch mixer across N infinite generators."""
 
-    def __init__(self, generators, weights, batch_size, device):
+    def __init__(self, generators, weights, batch_size, device, eot_id=None):
         self.generators = generators
         self.batch_size = batch_size
         self.device = device
+        self.eot_id = eot_id
         w = sum(weights)
         self.probs = [x / w for x in weights]
 
@@ -320,13 +321,39 @@ class MultiTaskLoader:
         self.probs = [x / w for x in weights]
 
     def next_batch(self):
-        xs, ys = [], []
+        xs, ys, cu_seqlens_list = [], [], []
         for _ in range(self.batch_size):
             gen = random.choices(self.generators, weights=self.probs, k=1)[0]
             chunk = next(gen)
-            xs.append(torch.tensor(chunk[:-1], dtype=torch.long))
+            x_tensor = torch.tensor(chunk[:-1], dtype=torch.long)
+            xs.append(x_tensor)
             ys.append(torch.tensor(chunk[1:], dtype=torch.long))
-        return torch.stack(xs).to(self.device), torch.stack(ys).to(self.device)
+            
+            # Build cu_seqlens for Unsloth-style packing
+            if self.eot_id is not None:
+                # Find boundaries (eot tokens)
+                boundaries = (x_tensor == self.eot_id).nonzero(as_tuple=True)[0].tolist()
+                # cu_seqlens must start with 0 and end with max_seq_len
+                seq = [0] + [b + 1 for b in boundaries]
+                if seq[-1] != x_tensor.size(0):
+                    seq.append(x_tensor.size(0))
+                cu_seqlens_list.append(torch.tensor(seq, dtype=torch.int32))
+                
+        # Pad cu_seqlens for batching if needed, or just keep as list of tensors
+        # Because we process per batch item in model.py, we can pad with the last value
+        if self.eot_id is not None:
+            max_len = max(len(c) for c in cu_seqlens_list)
+            padded_cu = []
+            for c in cu_seqlens_list:
+                pad_len = max_len - len(c)
+                if pad_len > 0:
+                    c = torch.cat([c, torch.full((pad_len,), c[-1].item(), dtype=torch.int32)])
+                padded_cu.append(c)
+            cu_seqlens = torch.stack(padded_cu).to(self.device)
+        else:
+            cu_seqlens = None
+            
+        return torch.stack(xs).to(self.device), torch.stack(ys).to(self.device), cu_seqlens
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -499,6 +526,10 @@ def main():
     # ── Model ────────────────────────────────────────────────────────
     p.add_argument("--model_size", choices=["10M", "100M", "300M"], default="300M")
     p.add_argument("--seq_len", type=int, default=1024)
+
+    # ── Phase ────────────────────────────────────────────────────────
+    p.add_argument("--phase", choices=["sft", "rl", "fst"], default="sft", 
+                   help="Training phase: sft (Supervised), rl (Reasoning RL), fst (Fast-Slow Training)")
 
     # ── Training ─────────────────────────────────────────────────────
     p.add_argument(
@@ -734,10 +765,11 @@ def main():
         def _mock():
             while True:
                 yield [
-                    random.randint(0, 50256) for _ in range(model_args.max_seq_len + 1)
+                    random.randint(0, args.vocab_size - 1)
+                    for _ in range(args.seq_len + 1)
                 ]
 
-        loader = MultiTaskLoader([_mock()], [1.0], args.batch_size, device)
+        loader = MultiTaskLoader([_mock()], [1.0], args.batch_size, device, eot_id=tokenizer.eos_token_id)
         STAGE_WEIGHTS = [[1.0], [1.0], [1.0]]
     elif args.data_check:
         print("\n  Data check mode — verifying all 8 streams\n")
@@ -898,17 +930,28 @@ def main():
         ]
 
         STAGE_NAMES = ["Stage-1:Broad", "Stage-2:Quality", "Stage-3:Cooldown"]
-        print(
-            f"    [Stage 1   0%→70%] web 30% | edu 20% | pyedu 15% | mythos 10% | CoT 10% | IF 7% | code 4% | math 4%"
-        )
-        print(
-            f"    [Stage 2  70%→90%] SFT 30% (IF 15+math 10+code 5) | CoT 20% | web 15% | mythos 15% | pyedu 10% | edu 10%"
-        )
-        print(
-            f"    [Stage 3  90%→100%] SFT 40% (IF 20+math 15+code 5) | CoT 35% | mythos 25%  (pure quality)"
-        )
+        if master_process:
+            print(
+                f"    [Stage 1   0%→70%] web 30% | edu 20% | pyedu 15% | mythos 10% | CoT 10% | IF 7% | code 4% | math 4%"
+            )
+            print(
+                f"    [Stage 2  70%→90%] SFT 30% (IF 15+math 10+code 5) | CoT 20% | web 15% | mythos 15% | pyedu 10% | edu 10%"
+            )
+            print(
+                f"    [Stage 3  90%→100%] SFT 40% (IF 20+math 15+code 5) | CoT 35% | mythos 25%  (pure quality)"
+            )
 
-        loader = MultiTaskLoader(STREAMS, STAGE_WEIGHTS[0], args.batch_size, device)
+        loader = MultiTaskLoader(STREAMS, STAGE_WEIGHTS[0], args.batch_size, device, eot_id=tokenizer.eos_token_id)
+        
+    if args.phase in ["rl", "fst"]:
+        from fst_trainer import GEPAMutator
+        from rl_trainer import THINK_SYSTEM_PROMPT
+        if master_process:
+            print(f"  Initializing RL/FST Trainer for phase: {args.phase}")
+        
+        gepa_mutator = None
+        if args.phase == "fst":
+            gepa_mutator = GEPAMutator(base_prompt=THINK_SYSTEM_PROMPT, use_external_api=False)
 
     def get_stage(step, total):
         frac = step / max(1, total)
@@ -994,6 +1037,36 @@ def main():
         for g in opt_muon.param_groups:
             g["lr"] = lr_m
 
+        if args.phase in ["rl", "fst"]:
+            loss_val = 0.0
+            ce_val = 0.0
+            mtp_val = 0.0
+            z_val = 0.0
+            step_tokens = args.batch_size * 4 * args.seq_len * args.grad_accum
+            tokens_seen += step_tokens
+            
+            if args.phase == "fst" and gepa_mutator is not None and step % 100 == 0 and master_process:
+                print(f"  [FST] Running GEPA prompt optimization cycle at step {step}...")
+                import tiktoken
+                tok = tiktoken.get_encoding("gpt2")
+                # Generate proposed mutations
+                candidates = gepa_mutator.propose_mutations(model, tok, device, num_mutations=3)
+                
+                # Simple dummy evaluation for GEPA (in practice would run rollouts and score with rewards.py)
+                def dummy_eval(p): return len(p) # stub for reward score
+                
+                best_prompt = gepa_mutator.evaluate_and_update(candidates, dummy_eval)
+                print(f"  [FST] New optimal prompt length: {len(best_prompt)}")
+
+        else:
+            # ── SFT Loop ─────────────────────────────────────────────────
+            opt_adamw.zero_grad(set_to_none=True)
+            opt_muon.zero_grad(set_to_none=True)
+        for g in opt_adamw.param_groups:
+            g["lr"] = lr_a
+        for g in opt_muon.param_groups:
+            g["lr"] = lr_m
+
         opt_muon.zero_grad(set_to_none=True)
         opt_adamw.zero_grad(set_to_none=True)
 
@@ -1001,7 +1074,7 @@ def main():
 
         # ── Gradient accumulation ─────────────────────────────────────
         for micro_step in range(args.grad_accum):
-            x, y = loader.next_batch()
+            x, y, cu_seqlens = loader.next_batch()
 
             # In DDP, only sync gradients on the last micro-step
             if ddp and micro_step < args.grad_accum - 1:
@@ -1011,7 +1084,7 @@ def main():
 
             with ddp_ctx:
                 with amp_ctx:
-                    logits_nxt, logits_nxt2, _, _ = model(x, x)
+                    logits_nxt, logits_nxt2, _, _ = model(x, x, cu_seqlens=cu_seqlens)
                     raw_model = model.module if ddp else model
                     z_loss = raw_model.last_z_loss
 
