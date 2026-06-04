@@ -947,6 +947,7 @@ class LasmoidV1(nn.Module):
         # Output head (tied to embedding)
         self.head   = Linear(args.dim, args.vocab_size)
         self.head.weight = self.emb.weight  # weight tying
+        nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)
 
         # HC head for main model output (from V4-Pro ParallelHead)
         hc_mult = args.num_residual_streams
