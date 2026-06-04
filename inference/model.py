@@ -257,10 +257,10 @@ def precompute_freqs_cis(
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """
-    In-place rotary embedding application.
+    Out-of-place rotary embedding application.
     inverse=True: conjugate (de-rotation) for output de-rotation (V4-Pro apply_rotary_emb).
     """
-    y = x
+    dtype = x.dtype
     xc = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
@@ -269,8 +269,7 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     else:
         freqs_cis = freqs_cis.view(1, xc.size(1), 1, xc.size(-1))
     xr = torch.view_as_real(xc * freqs_cis).flatten(-2)
-    y.copy_(xr)
-    return y
+    return xr.to(dtype)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -338,12 +337,16 @@ class MLA(nn.Module):
         q = q.unflatten(-1, (self.n_heads, self.head_dim))             # (B,N,H,head_dim)
         # Per-head RMS normalisation (V4-Pro line 498)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        apply_rotary_emb(q[..., -self.rope_head_dim:], freqs_cis)     # in-place
+        q_nope, q_rope = q[..., :-self.rope_head_dim], q[..., -self.rope_head_dim:]
+        q_rope = apply_rotary_emb(q_rope, freqs_cis)
+        q = torch.cat([q_nope, q_rope], dim=-1)
 
         # ── KV compression (MLA sovereign) ───────────────────────────
         kv = self.wkv(x)                                               # (B,N,head_dim)
         kv = self.kv_norm(kv)
-        apply_rotary_emb(kv[..., -self.rope_head_dim:], freqs_cis)    # in-place
+        kv_nope, kv_rope = kv[..., :-self.rope_head_dim], kv[..., -self.rope_head_dim:]
+        kv_rope = apply_rotary_emb(kv_rope, freqs_cis)
+        kv = torch.cat([kv_nope, kv_rope], dim=-1)
         # QAT: simulate FP8 on nope dims (V4-Pro line 506)
         act_quant(kv[..., :-self.rope_head_dim].contiguous(), 64, scale_fmt, scale_dtype, True)
 
@@ -418,7 +421,9 @@ class MLA(nn.Module):
             )  # (B, H, N, D)
         # De-rotate rope dims on output (V4-Pro line 534)
         attn_out_perm = attn_out.transpose(1, 2)                        # (B,N,H,D)
-        apply_rotary_emb(attn_out_perm[..., -self.rope_head_dim:], freqs_cis, inverse=True)
+        attn_nope, attn_rope = attn_out_perm[..., :-self.rope_head_dim], attn_out_perm[..., -self.rope_head_dim:]
+        attn_rope = apply_rotary_emb(attn_rope, freqs_cis, inverse=True)
+        attn_out_perm = torch.cat([attn_nope, attn_rope], dim=-1)
 
         # ── Grouped O projection (V4-Pro lines 537-542) ───────────────
         o = attn_out_perm.reshape(B, N, self.n_groups, -1)             # (B,N,G,H/G*D)

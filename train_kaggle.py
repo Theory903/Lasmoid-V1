@@ -427,6 +427,21 @@ def load_checkpoint(model, opt_muon, opt_adamw, api, repo_id, hf_token, device):
 #   100M → ~670M tokens minimum
 #   300M → ~2.0B tokens minimum
 MODEL_CONFIGS = {
+    "10M": dict(
+        dim=128,
+        n_layers=4,
+        n_heads=4,
+        head_dim=48,
+        q_lora_rank=32,
+        o_lora_rank=32,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_activated_experts=2,
+        moe_inter_dim=256,
+        max_seq_len=256,
+        # verified: 9,379,108 params
+        _verified_params=9_379_108,
+    ),
     "100M": dict(
         dim=512,
         n_layers=8,
@@ -471,7 +486,7 @@ def main():
     p = argparse.ArgumentParser(description="LasmoidV1 Production Trainer v2")
 
     # ── Model ────────────────────────────────────────────────────────
-    p.add_argument("--model_size", choices=["100M", "300M"], default="300M")
+    p.add_argument("--model_size", choices=["10M", "100M", "300M"], default="300M")
     p.add_argument("--seq_len", type=int, default=1024)
 
     # ── Training ─────────────────────────────────────────────────────
@@ -620,7 +635,10 @@ def main():
 
     # Wrap model in DDP
     if ddp:
-        model = DDP(model, device_ids=[ddp_local_rank])
+        if device.startswith("cuda"):
+            model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
+        else:
+            model = DDP(model, find_unused_parameters=True)
 
     # ── Optimizers ────────────────────────────────────────────────────
     muon_params, adamw_params = [], []
