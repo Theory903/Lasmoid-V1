@@ -767,7 +767,7 @@ def main():
         def _mock():
             while True:
                 yield [
-                    random.randint(0, args.vocab_size - 1)
+                    random.randint(0, model_args.vocab_size - 1)
                     for _ in range(args.seq_len + 1)
                 ]
 
