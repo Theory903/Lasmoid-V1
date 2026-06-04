@@ -774,6 +774,12 @@ def main():
         loader = MultiTaskLoader([_mock()], [1.0], args.batch_size, device, eot_id=tok.eot_token)
         STAGE_WEIGHTS = [[1.0], [1.0], [1.0]]
     elif args.data_check:
+        if not master_process:
+            if dist.is_initialized():
+                dist.barrier()
+                dist.destroy_process_group()
+            return
+
         print("\n  Data check mode — verifying all 8 streams\n")
 
         from datasets import load_dataset
@@ -814,6 +820,7 @@ def main():
                 print(f"    ERROR: {e}")
         print("\n  All stream checks complete ✓")
         if dist.is_initialized():
+            dist.barrier()
             dist.destroy_process_group()
         return
     else:
