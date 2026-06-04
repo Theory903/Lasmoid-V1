@@ -49,6 +49,16 @@ if not HAS_TILELANG:
     except ImportError:
         pass
 
+SUPPORT_FP8_TRITON = False
+if HAS_TRITON:
+    try:
+        if torch.cuda.is_available():
+            device_id = torch.cuda.current_device()
+            if torch.cuda.get_device_capability(device_id) >= (8, 0):
+                SUPPORT_FP8_TRITON = True
+    except Exception:
+        pass
+
 # ══════════════════════════════════════════════════════════════════════
 # TRITON KERNELS (CUDA only, skipped on MPS/CPU)
 # ══════════════════════════════════════════════════════════════════════
@@ -279,7 +289,7 @@ def act_quant(
             block_size //= 2
     use_ue8m0 = (scale_fmt == "ue8m0")
 
-    if HAS_TRITON and x.is_cuda and not inplace:
+    if HAS_TRITON and SUPPORT_FP8_TRITON and x.is_cuda and not inplace:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
         s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=scale_dtype)
         grid = lambda meta: (x.numel() // meta['BLOCK_SIZE'],)
@@ -351,7 +361,7 @@ def fp4_act_quant(
         while x.size(-1) % block_size != 0 and block_size > 1:
             block_size //= 2
 
-    if HAS_TRITON and x.is_cuda and not inplace:
+    if HAS_TRITON and SUPPORT_FP8_TRITON and x.is_cuda and not inplace:
         y = torch.empty_like(x, dtype=torch.float32) # Storing simulated FP4 as float32
         s = x.new_empty(*x.size()[:-1], x.size(-1) // block_size, dtype=torch.float32)
         grid = lambda meta: (x.numel() // block_size,)
@@ -404,7 +414,7 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     assert x.is_contiguous() and s.is_contiguous()
     M, N = x.shape
 
-    if HAS_TRITON and x.is_cuda:
+    if HAS_TRITON and SUPPORT_FP8_TRITON and x.is_cuda:
         y = torch.empty_like(x, dtype=torch.get_default_dtype())
         grid = lambda meta: (triton.cdiv(M, meta['BLOCK']), triton.cdiv(N, meta['BLOCK']))
         _weight_dequant_kernel[grid](x, s, y, M, N, BLOCK=block_size)
@@ -429,7 +439,7 @@ def fp8_gemm(
     assert a.is_contiguous() and b.is_contiguous()
     assert a_s.is_contiguous() and b_s.is_contiguous()
 
-    if HAS_TRITON and a.is_cuda and b.is_cuda:
+    if HAS_TRITON and SUPPORT_FP8_TRITON and a.is_cuda and b.is_cuda:
         K = a.size(-1); M = a.numel() // K; N = b.size(0)
         c = a.new_empty(*a.size()[:-1], N, dtype=torch.get_default_dtype())
         grid = lambda meta: (triton.cdiv(M, meta['BLOCK_M']), triton.cdiv(N, meta['BLOCK_N']))
