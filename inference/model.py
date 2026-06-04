@@ -100,7 +100,7 @@ class ModelArgs:
     moe_inter_dim: int = 256
     score_func: Literal["softmax", "sigmoid", "sqrtsoftplus"] = "sqrtsoftplus"
     route_scale: float = 1.0
-    swiglu_limit: float = 0.0      # 0 = disabled; V4 uses 10.0
+    swiglu_limit: float = 10.0      # 0 = disabled; V4 uses 10.0
     n_hash_layers: int = 0         # hash-routed layers (V4 first N layers)
 
     # ── HC (Hyper-Connections) (SOVEREIGN) ───────────────────────────

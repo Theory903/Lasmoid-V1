@@ -160,11 +160,16 @@ class Muon(torch.optim.Optimizer):
                 update = buf.add(grad, alpha=mu) if nesterov else buf.clone()
 
                 if p.ndim == 2:  # Newton-Schulz for weight matrices only
+                    transposed = update.shape[0] > update.shape[1]
+                    if transposed:
+                        update = update.T
                     X = update / (update.norm() + 1e-8)
                     for _ in range(g["ns_steps"]):
                         A = X @ X.T
                         X = self._A * X + self._B * (A @ X) + self._C * (A @ A @ X)
                     update = X * (update.norm() + 1e-8)
+                    if transposed:
+                        update = update.T
 
                 if g["weight_decay"] > 0:
                     p.mul_(1.0 - lr * g["weight_decay"])

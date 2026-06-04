@@ -33,6 +33,9 @@ class Muon(torch.optim.Optimizer):
                 
                 if len(p.shape) == 2:  # Newton-Schulz for 2D matrices
                     G = buf.clone()
+                    transposed = G.shape[0] > G.shape[1]
+                    if transposed:
+                        G = G.T
                     a, b, c = 3.4445, -4.7750, 2.0315
                     X = G / (G.norm() + 1e-8)
                     for _ in range(5):
@@ -40,6 +43,8 @@ class Muon(torch.optim.Optimizer):
                         B = A @ X
                         X = a * X + b * B + c * A @ B
                     update = X * (G.norm() + 1e-8)
+                    if transposed:
+                        update = update.T
                 else:
                     update = buf
                 p.add_(update, alpha=-lr)
