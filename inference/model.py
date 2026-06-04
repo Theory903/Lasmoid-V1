@@ -803,8 +803,8 @@ class MHCBlock(nn.Module):
         x: (B,S,D), residual: (B,S,hc,D), post: (B,S,hc), comb: (B,S,hc,hc)
         → (B,S,hc,D)
         """
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + \
-            torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        # Batched matmul (was broadcast OOM at ~192 MiB float32 intermediate)
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.matmul(comb.bfloat16(), residual)
         return y.type_as(x)
 
 

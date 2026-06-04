@@ -198,6 +198,7 @@ def stream_packed_tokens(
     seq_len: int,
     label: str = "",
     split: str = "train",
+    hf_token: str | None = None,
 ):
     """
     Infinite streaming generator with universal schema normalisation.
@@ -224,7 +225,7 @@ def stream_packed_tokens(
                 config_name,
                 streaming=True,
                 split=split,
-                trust_remote_code=True,
+                token=hf_token,
             )
             for row in ds:
                 # ── Universal schema → plain text ────────────────────
@@ -690,7 +691,7 @@ def main():
             print(f"    split:   {split}")
             try:
                 ds = load_dataset(
-                    path, config, split=split, streaming=True, trust_remote_code=True
+                    path, config, split=split, streaming=True, token=hf_token
                 )
                 first = next(iter(ds))
                 print(f"    columns: {list(first.keys())}")
@@ -730,6 +731,7 @@ def main():
             tok,
             model_args.max_seq_len,
             label="UltraFineWeb",
+            hf_token=hf_token,
         )
 
         GEN_IF = stream_packed_tokens(
@@ -739,6 +741,7 @@ def main():
             model_args.max_seq_len,
             label="UltraData-IF",
             split="no_think",
+            hf_token=hf_token,
         )
 
         GEN_MATH = stream_packed_tokens(
@@ -748,6 +751,7 @@ def main():
             model_args.max_seq_len,
             label="UltraData-Math",
             split="no_think",
+            hf_token=hf_token,
         )
 
         GEN_SFT_CODE = stream_packed_tokens(
@@ -757,6 +761,7 @@ def main():
             model_args.max_seq_len,
             label="UltraData-Code",
             split="no_think",
+            hf_token=hf_token,
         )
 
         GEN_MYTHOS = stream_packed_tokens(
@@ -765,6 +770,7 @@ def main():
             tok,
             model_args.max_seq_len,
             label="Claude-Mythos",
+            hf_token=hf_token,
         )
 
         GEN_THINK = stream_packed_tokens(
@@ -773,6 +779,7 @@ def main():
             tok,
             model_args.max_seq_len,
             label="DeepThink",
+            hf_token=hf_token,
         )
 
         GEN_PYEDU = stream_packed_tokens(
@@ -781,6 +788,7 @@ def main():
             tok,
             model_args.max_seq_len,
             label="PythonEdu",
+            hf_token=hf_token,
         )
 
         GEN_EDU = stream_packed_tokens(
@@ -789,6 +797,7 @@ def main():
             tok,
             model_args.max_seq_len,
             label="FineWeb-Edu",
+            hf_token=hf_token,
         )
 
         STREAMS = [
