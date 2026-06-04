@@ -34,6 +34,48 @@ Dataset curriculum (inspired by Llama-3, Phi-4, YuLan-Mini):
 
 import os, sys, time, math, random, argparse
 
+# ── Early data_check exit (MUST run before importing torch/initializing CUDA) ──
+if "--data_check" in sys.argv:
+    is_master = int(os.environ.get("RANK", 0)) == 0
+    if is_master:
+        from datasets import load_dataset
+        _hf_token = os.getenv("HF_TOKEN")
+        print("\n  Data check mode — verifying all 8 streams\n")
+        stream_infos = [
+            (
+                "UltraFineWeb",
+                "openbmb/Ultra-FineWeb-L3",
+                "Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
+                "train",
+            ),
+            ("UltraData-IF",   "openbmb/UltraData-SFT-2605", "IF",          "no_think"),
+            ("UltraData-Math", "openbmb/UltraData-SFT-2605", "Math",        "no_think"),
+            ("UltraData-Code", "openbmb/UltraData-SFT-2605", "Code",        "no_think"),
+            ("Claude-Mythos",  "WithinUsAI/claude_mythos_distilled_25k", None, "train"),
+            ("DeepThink",      "HelioAI/Claude-Opus-4.8-DeepThink-462x-105M", None, "train"),
+            ("PythonEdu",      "HuggingFaceTB/smollm-corpus", "python-edu", "train"),
+            ("FineWeb-Edu",    "HuggingFaceFW/fineweb-edu",   "sample-10BT", "train"),
+        ]
+        for label, path, config, split in stream_infos:
+            print(f"\n  [{label}]")
+            print(f"    dataset: {path}")
+            if config:
+                print(f"    config:  {config}")
+            print(f"    split:   {split}")
+            try:
+                ds = load_dataset(path, config, split=split, streaming=True, token=_hf_token)
+                first = next(iter(ds))
+                print(f"    columns: {list(first.keys())}")
+                for k, v in first.items():
+                    val = str(v)
+                    if len(val) > 150:
+                        val = val[:150] + "..."
+                    print(f"      {k}: {type(v).__name__} = {val}")
+            except Exception as e:
+                print(f"    ERROR: {e}")
+        print("\n  All stream checks complete ✓")
+    sys.exit(0)
+
 # Prevent CUDA memory fragmentation on Kaggle T4 (16GB)
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -588,49 +630,6 @@ def main():
         help="Verify all dataset streams open correctly, then exit",
     )
     args = p.parse_args()
-
-    # ── Early data_check exit ──
-    # Must run before ANY torch.cuda calls (which initialize CUDA and prevent subsequent forks)
-    if args.data_check:
-        is_master = int(os.environ.get("RANK", 0)) == 0
-        if is_master:
-            from datasets import load_dataset
-            _hf_token = os.getenv("HF_TOKEN")
-            print("\n  Data check mode — verifying all 8 streams\n")
-            stream_infos = [
-                (
-                    "UltraFineWeb",
-                    "openbmb/Ultra-FineWeb-L3",
-                    "Ultra-FineWeb-L3-en-Multi-Style-Synthetic",
-                    "train",
-                ),
-                ("UltraData-IF",   "openbmb/UltraData-SFT-2605", "IF",          "no_think"),
-                ("UltraData-Math", "openbmb/UltraData-SFT-2605", "Math",        "no_think"),
-                ("UltraData-Code", "openbmb/UltraData-SFT-2605", "Code",        "no_think"),
-                ("Claude-Mythos",  "WithinUsAI/claude_mythos_distilled_25k", None, "train"),
-                ("DeepThink",      "HelioAI/Claude-Opus-4.8-DeepThink-462x-105M", None, "train"),
-                ("PythonEdu",      "HuggingFaceTB/smollm-corpus", "python-edu", "train"),
-                ("FineWeb-Edu",    "HuggingFaceFW/fineweb-edu",   "sample-10BT", "train"),
-            ]
-            for label, path, config, split in stream_infos:
-                print(f"\n  [{label}]")
-                print(f"    dataset: {path}")
-                if config:
-                    print(f"    config:  {config}")
-                print(f"    split:   {split}")
-                try:
-                    ds = load_dataset(path, config, split=split, streaming=True, token=_hf_token)
-                    first = next(iter(ds))
-                    print(f"    columns: {list(first.keys())}")
-                    for k, v in first.items():
-                        val = str(v)
-                        if len(val) > 150:
-                            val = val[:150] + "..."
-                        print(f"      {k}: {type(v).__name__} = {val}")
-                except Exception as e:
-                    print(f"    ERROR: {e}")
-            print("\n  All stream checks complete ✓")
-        sys.exit(0)
 
     global _SESSION_LIMIT
     _SESSION_LIMIT = args.session_hours * 3600
