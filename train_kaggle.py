@@ -353,6 +353,20 @@ def stream_packed_tokens(
                     buf = buf[seq_len:]
 
         except Exception as e:
+            err_str = str(e)
+            is_auth_error = (
+                "gated dataset" in err_str.lower()
+                or "authenticated" in err_str.lower()
+                or "401" in err_str.lower()
+                or "403" in err_str.lower()
+                or "forbidden" in err_str.lower()
+                or "gatedrepo" in type(e).__name__.lower()
+            )
+            if is_auth_error:
+                print(f"\n[FATAL ERROR] Gated/private dataset authentication failed for '{dataset_name}'.", flush=True)
+                print(f"Please ensure HF_TOKEN is correctly set, has been accepted on the HF website, and has read access to gated datasets.", flush=True)
+                print(f"Details: {e!r}\n", flush=True)
+                os._exit(1)
             print(f"    [{tag}] error: {e!r} → retry in 5s", flush=True)
             time.sleep(5)
 
