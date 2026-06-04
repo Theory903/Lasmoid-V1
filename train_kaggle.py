@@ -634,6 +634,12 @@ def main():
         action="store_true",
         help="Verify all dataset streams open correctly, then exit",
     )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Device to run on: cuda, mps, cpu",
+    )
     args = p.parse_args()
 
     global _SESSION_LIMIT
@@ -642,12 +648,12 @@ def main():
     # ── DDP Setup ────────────────────────────────────────────────────
     ddp = int(os.environ.get("RANK", -1)) != -1
     if ddp:
-        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        backend = "nccl" if (torch.cuda.is_available() and args.device == "cuda") else "gloo"
         dist.init_process_group(backend=backend)
         ddp_rank = int(os.environ["RANK"])
         ddp_local_rank = int(os.environ["LOCAL_RANK"])
         ddp_world_size = int(os.environ["WORLD_SIZE"])
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and args.device == "cuda":
             device = f"cuda:{ddp_local_rank}"
             torch.cuda.set_device(device)
         else:
@@ -658,13 +664,13 @@ def main():
         ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
-        device = (
-            "cuda"
-            if torch.cuda.is_available()
-            else "mps"
-            if torch.backends.mps.is_available()
-            else "cpu"
-        )
+        
+        if args.device == "cuda" and torch.cuda.is_available():
+            device = "cuda"
+        elif args.device == "mps" and torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
 
     dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
     amp_dtype = dtype_map[args.dtype]
