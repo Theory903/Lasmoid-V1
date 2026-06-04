@@ -280,7 +280,12 @@ def stream_packed_tokens(
 
     if rank == 0:
         print(f"    [{tag}] opening stream (split={split})...", flush=True)
-    eot = tokenizer.eos_token_id
+    if hasattr(tokenizer, "eot_token"):
+        eot = tokenizer.eot_token
+    elif hasattr(tokenizer, "eos_token_id"):
+        eot = tokenizer.eos_token_id
+    else:
+        eot = 50256
     buf = []
 
     while True:
