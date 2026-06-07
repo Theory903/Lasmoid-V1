@@ -198,7 +198,13 @@ class Linear(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        nn.init.normal_(self.weight, 0.0, 0.02)
+        if self.weight.dtype == torch.float8_e4m3fn:
+            # Initialize in float32 then cast to float8 to avoid CPU/MPS normal_ not implemented error
+            tmp = torch.empty_like(self.weight, dtype=torch.float32)
+            nn.init.normal_(tmp, 0.0, 0.02)
+            self.weight.data.copy_(tmp.to(self.weight.dtype))
+        else:
+            nn.init.normal_(self.weight, 0.0, 0.02)
         if self.scale is not None:
             nn.init.constant_(self.scale, 1.0)
         if self.bias is not None:
@@ -375,12 +381,9 @@ class MLA(nn.Module):
                 self.kv_cache[:B, cutoff:win], self.kv_cache[:B, :cutoff] = \
                     kv[:, -win:].split([win - cutoff, cutoff], dim=1)
         else:
-            # FIX: clamp start_pos to [0, win-1] using modulo, BUT with a sliding-
-            # window offset so decode steps >= win don't overwrite prefill keys from
-            # position 0 again.  Use (start_pos - 1) % win so position `win` maps
-            # to slot win-1, position win+1 maps to slot 0, etc. — a proper ring
+            # FIX: clamp start_pos to [0, win-1] using modulo: a proper circular
             # buffer that never aliases back into unread prefill slots.
-            slot = (start_pos - 1) % win
+            slot = start_pos % win
             self.kv_cache[:B, slot] = kv[:, 0]
 
         # ── Prepare KV for Attention ─────────────────────────────────
@@ -600,61 +603,51 @@ class ElasticSparseConceptMemory(nn.Module):
             # Update centroid in meta_centroids
             self.meta_centroids.data[block_idx].copy_(torch.mean(self.slot_db[block_idx], dim=0))
             
-        # 4. Check for elastic spawn condition
-        # ── DDP-safe spawn gate ──────────────────────────────────────────────
-        # CRITICAL: Each rank may see a different `loss.item()` value (different
-        # micro-batch data). If we let each rank decide independently, one rank
-        # may spawn a new block (adding new parameters to DDP grad-sync) while
-        # the other does not → NCCL allreduce skew → 10-minute timeout crash.
-        #
-        # Fix: broadcast a single binary flag from Rank 0 so every rank makes
-        # the same spawn decision. This adds one tiny broadcast per HCM forward
-        # (negligible vs the allreduce-on-all-params cost).
-        should_spawn_local = (
+        # 4. Check for elastic spawn or recursion condition (DDP-safe)
+        should_recurse_local = (
             loss.item() > self.entropy_threshold
-            and len(self.concept_blocks) < self.max_blocks
+            and (block_idx + 1 < len(self.concept_blocks) or len(self.concept_blocks) < self.max_blocks)
         )
         if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            spawn_flag = torch.tensor(
-                int(should_spawn_local), dtype=torch.int32, device=loss.device
+            recurse_flag = torch.tensor(
+                int(should_recurse_local), dtype=torch.int32, device=loss.device
             )
-            dist.broadcast(spawn_flag, src=0)
-            should_spawn = bool(spawn_flag.item())
+            dist.broadcast(recurse_flag, src=0)
+            should_recurse = bool(recurse_flag.item())
         else:
-            should_spawn = should_spawn_local
+            should_recurse = should_recurse_local
 
-        if should_spawn:
-            # Freeze current block
-            for p in self.concept_blocks[block_idx].parameters():
-                p.requires_grad = False
+        if should_recurse:
+            # Check if we need to spawn the next block (meaning it does not exist yet)
+            if block_idx + 1 == len(self.concept_blocks):
+                # Freeze current block
+                for p in self.concept_blocks[block_idx].parameters():
+                    p.requires_grad = False
 
-            # FIX: extend slot_db and meta_centroids BEFORE spawning and before
-            # the recursive call. The old code extended them after appending the
-            # new block, meaning the recursive call entered process_chunk with
-            # block_idx+1 but slot_db still had only block_idx rows → IndexError.
-            new_slots = self.slot_ema.clone()
-            self.register_buffer(
-                "slot_db",
-                torch.cat([self.slot_db, new_slots], dim=0),
-                persistent=True,
-            )
-            new_centroid = torch.zeros(
-                1, self.dim,
-                device=self.meta_centroids.device,
-                dtype=self.meta_centroids.dtype,
-            )
-            self.register_buffer(
-                "meta_centroids",
-                torch.cat([self.meta_centroids, new_centroid], dim=0),
-                persistent=False,
-            )
+                # Extend slot_db and meta_centroids
+                new_slots = self.slot_ema.clone()
+                self.register_buffer(
+                    "slot_db",
+                    torch.cat([self.slot_db, new_slots], dim=0),
+                    persistent=True,
+                )
+                new_centroid = torch.zeros(
+                    1, self.dim,
+                    device=self.meta_centroids.device,
+                    dtype=self.meta_centroids.dtype,
+                )
+                self.register_buffer(
+                    "meta_centroids",
+                    torch.cat([self.meta_centroids, new_centroid], dim=0),
+                    persistent=False,
+                )
 
-            # Spawn new block and reset EMA
-            new_block = self._create_block(self.args).to(device=pooled.device, dtype=pooled.dtype)
-            self.concept_blocks.append(new_block)
-            self.slot_ema.zero_()
+                # Spawn new block and reset EMA
+                new_block = self._create_block(self.args).to(device=pooled.device, dtype=pooled.dtype)
+                self.concept_blocks.append(new_block)
+                self.slot_ema.zero_()
 
-            # Recurse into the newly-created block (buffers are already sized)
+            # Recurse into the next block
             return self.process_chunk(encoder_hidden, block_idx + 1)
             
         return quantized, loss
@@ -1045,7 +1038,7 @@ class LasmoidV1(nn.Module):
         self.hc_mult     = args.num_residual_streams
 
         # Embedding (shared with head — tied weights)
-        self.emb = nn.Embedding(args.vocab_size, args.dim)
+        self.emb = nn.Embedding(args.vocab_size, args.dim).to(dtype=torch.bfloat16)
 
         # READ REPLICA (Encoder) — CQRS sovereign
         self.encoder_attn = MLA(0, args)
@@ -1057,15 +1050,12 @@ class LasmoidV1(nn.Module):
         self.decoder_norm = RMSNorm(args.dim, args.norm_eps)
 
         # Output head (tied to embedding)
-        self.head   = Linear(args.dim, args.vocab_size)
-        # FIX: weight tying replaces head.weight (a Linear Parameter with an
-        # optional .scale attribute for FP8) with emb.weight (a plain Embedding
-        # Parameter that has no .scale). fp8_gemm() later dereferences weight.scale
-        # → AttributeError. Preserve the scale attribute when FP8 is active.
-        _head_scale = getattr(self.head.weight, "scale", None)
+        self.head   = Linear(args.dim, args.vocab_size, dtype=torch.bfloat16)
+        
+        # Register load state dict pre-hook to handle FP8 checkpoints and tied weights
+        self._register_load_state_dict_pre_hook(self._load_state_dict_pre_hook)
+
         self.head.weight = self.emb.weight  # weight tying
-        if _head_scale is not None:
-            self.head.weight.scale = _head_scale  # restore FP8 scale metadata
         nn.init.normal_(self.emb.weight, mean=0.0, std=0.02)
 
         # HC head for main model output (from V4-Pro ParallelHead)
@@ -1091,7 +1081,7 @@ class LasmoidV1(nn.Module):
         self.register_buffer(
             "freqs_cis",
             precompute_freqs_cis(
-                args.rope_head_dim, args.max_seq_len,
+                args.rope_head_dim, args.max_seq_len + 1024,
                 args.original_seq_len, args.rope_theta,
                 args.rope_factor, args.beta_fast, args.beta_slow,
             ),
@@ -1101,6 +1091,32 @@ class LasmoidV1(nn.Module):
         self.gradient_checkpointing = False
         self.last_z_loss = torch.tensor(0.0)
         self.last_commit_loss = torch.tensor(0.0)
+
+    def _load_state_dict_pre_hook(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        emb_key = prefix + "emb.weight"
+        head_key = prefix + "head.weight"
+        head_scale_key = prefix + "head.scale"
+        
+        # 1. Handle head.scale if it exists in state_dict but not in the model
+        scale = None
+        if head_scale_key in state_dict:
+            scale = state_dict.pop(head_scale_key)
+            
+        # 2. Handle head.weight and emb.weight
+        if head_key in state_dict:
+            weight = state_dict[head_key]
+            if weight.dtype == torch.float8_e4m3fn:
+                # Dequantize FP8 head.weight to BF16
+                if scale is not None:
+                    dequantized = weight_dequant(weight, scale)
+                else:
+                    dequantized = weight.to(torch.bfloat16)
+                state_dict[emb_key] = dequantized
+                state_dict[head_key] = dequantized
+            elif emb_key in state_dict:
+                state_dict[head_key] = state_dict[emb_key]
+        elif emb_key in state_dict:
+            state_dict[head_key] = state_dict[emb_key]
 
     def gradient_checkpointing_enable(self, **kwargs):
         self.gradient_checkpointing = True
@@ -1145,7 +1161,7 @@ class LasmoidV1(nn.Module):
             assert x_enc is not None, "x_enc must be provided at start_pos == 0"
             _, N_enc = x_enc.shape
             freqs_cis_enc = self.freqs_cis[:N_enc]
-            H_enc   = self.emb(x_enc).to(default_dtype)
+            H_enc   = self.emb(x_enc).to(torch.bfloat16)
             enc_out = self.encoder_attn(self.encoder_norm(H_enc), freqs_cis_enc, start_pos=0)
             memory_state, commit_loss = self.memory.process_chunk(enc_out, block_idx=0)
             self.last_commit_loss = commit_loss
@@ -1153,7 +1169,7 @@ class LasmoidV1(nn.Module):
             concept_db = self.memory.lightning_retrieve(H_enc, top_k_blocks=self.args.lightning_topk_blocks)
 
         # ── 2. WRITE MASTER ───────────────────────────────────────────
-        H_dec     = self.emb(x_dec).to(default_dtype)
+        H_dec     = self.emb(x_dec).to(torch.bfloat16)
         H_memory  = torch.mean(memory_state, dim=1, keepdim=True).expand(-1, N_dec, -1)
 
         # Expand to hc_mult copies
@@ -1192,7 +1208,16 @@ class LasmoidV1(nn.Module):
         # MTP: produce next-next-token logits during training
         mtp_logits = None
         if self.training and N_dec > 1 and len(self.mtp) > 0:
-            mtp_logits = self.mtp[0](streams, freqs_cis_dec, x_dec, start_pos, concept_db)
+            # Shift hidden streams and decoding tokens to align:
+            # hidden state at t (streams[:, :-1]) + embedding of token at t+1 (x_dec[:, 1:])
+            # predicts token at t+2 (yb[:, 1:])
+            mtp_logits = self.mtp[0](
+                streams[:, :-1],
+                freqs_cis_dec[:-1],
+                x_dec[:, 1:],
+                start_pos,
+                concept_db,
+            )
 
         return logits, mtp_logits, concept_db, memory_state
 

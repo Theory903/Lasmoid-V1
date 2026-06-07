@@ -154,7 +154,7 @@ def train():
             if logits_next_next is not None:
                 # yb shifted for t+2 prediction
                 ce_loss_mtp = F.cross_entropy(
-                    logits_next_next[:, :-1].contiguous().view(-1, model_args.vocab_size),
+                    logits_next_next.view(-1, model_args.vocab_size),
                     yb[:, 1:].contiguous().view(-1)
                 )
             

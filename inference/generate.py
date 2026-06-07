@@ -28,6 +28,7 @@ import torch.nn.functional as F
 import tiktoken
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
     from .model import LasmoidV1, ModelArgs, Linear
@@ -343,39 +344,80 @@ def generate(
 # CHECKPOINT LOADING  (auto-detects .safetensors or .pt)
 # ══════════════════════════════════════════════════════════════════════
 
-def _load_checkpoint(model: LasmoidV1, ckpt_path: str, device: str) -> None:
-    # Priority 1: safetensors (preferred in 2026)
-    sf_files = sorted(glob.glob(os.path.join(ckpt_path, "*.safetensors")))
-    if sf_files:
-        try:
-            from safetensors.torch import load_file
-            state = {}
-            for f in sf_files:
-                state.update(load_file(f, device=device))
-            model.load_state_dict(state, strict=False)
-            print(f"[generate] Loaded safetensors from {ckpt_path}")
-            return
-        except Exception as e:
-            print(f"[generate] safetensors load failed ({e}), falling back to .pt")
-
-    # Priority 2: named final checkpoint
+def load_checkpoint_and_model(ckpt_path: str, config_path: str, device: str) -> tuple:
+    # 1. Find checkpoint file path
+    ckpt_file = None
     final = os.path.join(ckpt_path, "lasmoid_final.pt")
+    latest_pt = os.path.join(ckpt_path, "lasmoid_latest.pt")
     if os.path.exists(final):
-        sd = torch.load(final, map_location=device, weights_only=True)
-        model.load_state_dict(sd.get("model_state_dict", sd), strict=False)
-        print(f"[generate] Loaded {final}")
-        return
-
-    # Priority 3: latest step checkpoint
-    step_files = sorted(glob.glob(os.path.join(ckpt_path, "lasmoid_step_*.pt")),
-                        key=os.path.getmtime)
-    if step_files:
-        sd = torch.load(step_files[-1], map_location=device, weights_only=True)
-        model.load_state_dict(sd.get("model_state_dict", sd), strict=False)
-        print(f"[generate] Loaded {step_files[-1]}")
-        return
-
-    print("[generate] WARNING: No weights found. Running with random initialisation.")
+        ckpt_file = final
+    elif os.path.exists(latest_pt):
+        ckpt_file = latest_pt
+    else:
+        step_files = sorted(glob.glob(os.path.join(ckpt_path, "lasmoid_step_*.pt")))
+        if step_files:
+            ckpt_file = step_files[-1]
+            
+    # 2. Load the checkpoint file (if exists) and extract model_args
+    model_args = None
+    state_dict = None
+    if ckpt_file:
+        try:
+            sd = torch.load(ckpt_file, map_location=device, weights_only=False)
+            state_dict = sd.get("model_state_dict", sd)
+            model_args = sd.get("model_args")
+            print(f"[generate] Found checkpoint: {ckpt_file}")
+        except Exception as e:
+            print(f"[generate] Failed to load checkpoint file directly: {e}")
+            
+    # 3. If model_args not found in checkpoint, load from config
+    if model_args is None:
+        with open(config_path) as f:
+            config_dict = json.load(f)
+        from dataclasses import fields
+        valid_fields = {f.name for f in fields(ModelArgs)}
+        filtered_config = {k: v for k, v in config_dict.items() if k in valid_fields}
+        model_args = ModelArgs(**filtered_config)
+        print(f"[generate] Loaded config from {config_path}")
+        
+    # 4. Instantiate model
+    model = LasmoidV1(model_args).to(device)
+    
+    # 5. If state_dict is loaded, load it into model (handling dynamic expansion of slots)
+    if state_dict is not None:
+        # Dynamically expand concept blocks
+        block_indices = []
+        for key in state_dict.keys():
+            if key.startswith("memory.concept_blocks."):
+                parts = key.split(".")
+                block_indices.append(int(parts[2]))
+        num_blocks_in_ckpt = max(block_indices) + 1 if block_indices else 1
+        
+        current_num_blocks = len(model.memory.concept_blocks)
+        if num_blocks_in_ckpt > current_num_blocks:
+            dtype = next(model.parameters()).dtype
+            for i in range(current_num_blocks, num_blocks_in_ckpt):
+                new_block = model.memory._create_block(model.args).to(device=device, dtype=dtype)
+                model.memory.concept_blocks.append(new_block)
+                
+            model.memory.register_buffer(
+                "slot_db",
+                torch.zeros(num_blocks_in_ckpt, model.memory.num_concepts, model.memory.dim, device=device, dtype=dtype),
+                persistent=True
+            )
+            model.memory.register_buffer(
+                "meta_centroids",
+                torch.zeros(num_blocks_in_ckpt, model.memory.dim, device=device, dtype=dtype),
+                persistent=False
+            )
+            print(f"[generate] Dynamically expanded memory blocks to {num_blocks_in_ckpt}.")
+            
+        model.load_state_dict(state_dict, strict=True)
+        print(f"[generate] Successfully loaded weights from checkpoint.")
+    else:
+        print("[generate] WARNING: Running with random initialisation.")
+        
+    return model, model_args
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -406,17 +448,11 @@ def main(
 
     torch.manual_seed(42)
 
-    with open(config) as f:
-        config_dict = json.load(f)
-    args = ModelArgs(**config_dict)
+    model, args = load_checkpoint_and_model(ckpt_path, config, device)
+    model.eval()
 
     Linear.dtype     = torch.float8_e4m3fn if args.dtype == "fp8" else torch.bfloat16
     Linear.scale_fmt = getattr(args, "scale_fmt", None)
-
-    model = LasmoidV1(args).to(device)
-    model.eval()
-
-    _load_checkpoint(model, ckpt_path, device)
 
     enc          = tiktoken.get_encoding("gpt2")
     eos_token_id = enc.eot_token

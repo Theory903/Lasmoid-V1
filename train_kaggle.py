@@ -1183,9 +1183,7 @@ def main():
                     mtp = torch.tensor(0.0, device=device)
                     if logits_nxt2 is not None:
                         mtp = F.cross_entropy(
-                            logits_nxt2[:, :-1]
-                            .contiguous()
-                            .view(-1, model_args.vocab_size),
+                            logits_nxt2.view(-1, model_args.vocab_size),
                             y[:, 1:].contiguous().view(-1),
                             ignore_index=-1,
                         )

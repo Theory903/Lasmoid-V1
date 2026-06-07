@@ -6,7 +6,7 @@
 </div>
 
 <hr>
-
+     
 ## Table of Contents
 1. [Introduction](#1-introduction)
 2. [Architectural Highlights](#2-architectural-highlights)
